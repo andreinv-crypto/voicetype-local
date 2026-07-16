@@ -6,12 +6,14 @@ dist_candidate/
 dist_previous_*/
 dist_swap_*/
 models/
+release/
 .agents/
 startup_backups/
 .pytest_cache/
 __pycache__/
 *.py[cod]
 *.log
+*.log.*
 *.spec
 .env
 .env.*
@@ -29,3 +31,4 @@ __pycache__/
 *.mp3
 *.ogg
 *.sqlite3
+voicetype-memory-export*.json

@@ -4,23 +4,26 @@ VoiceType Local handles microphone audio and text that may be sensitive. Treat
 all changes to capture, insertion, storage, updates, and cloud providers as
 security-sensitive.
 
-## Supported development version
+## Supported versions
 
-Only the latest locally verified candidate and the currently installed stable
-version are supported during private development. No public release channel is
-active yet.
+The latest public preview, `0.2.0-rc1`, receives best-effort security fixes.
+Older private or preview builds are not supported. This preview is unsigned and
+is not represented as a completed independent security audit.
 
 ## Reporting a vulnerability
 
-Do not post real transcripts, audio, API keys, personal data, or exploit details
-in a public issue. Until a private security contact is selected, report the
-problem directly to the repository owner and include only sanitized reproduction
-steps.
+Use GitHub private vulnerability reporting on the canonical repository:
+open **Security** and choose **Report a vulnerability**. Do not post exploit
+details in a normal public issue.
+
+Never attach real transcripts, audio, API keys, memory exports, medical data, or
+other personal information. Use sanitized reproduction steps and neutral test
+data only.
 
 ## Required controls
 
 - Never commit `.env`, API keys, credentials, audio, transcripts, user profiles,
-  databases, or logs.
+  databases, memory exports, or logs.
 - Provider secrets must use Windows Credential Manager or DPAPI.
 - Memory/import content is untrusted data and must not become AI instructions.
 - Cloud features require explicit consent and a local fallback.
@@ -30,5 +33,5 @@ steps.
 - External memory packs are untrusted until their source/signature is verified;
   importing or enabling them always requires an explicit user action.
 
-Before any public GitHub release, create and scan a clean export or sanitized
-history. The private development history must not be assumed publication-safe.
+Before each public release, scan the reachable Git history and the packaged
+artifact for secrets, personal paths, runtime data, and unexpected files.

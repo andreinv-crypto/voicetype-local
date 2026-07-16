@@ -1,14 +1,35 @@
-VoiceType Local Source-Available Development License
+VoiceType Local Community Preview License 1.0
 
-Copyright (c) 2026 VoiceType Local contributors. All rights reserved.
+Canonical repository:
+https://github.com/andreinv-crypto/voicetype-local
 
-This repository is currently under private product development. Permission is
-granted to the owner and explicitly authorized contributors to use, copy, and
-modify the software for development and testing.
+Project Owner and Licensor: the owner of the canonical repository identified
+above (the "Licensor").
 
-No permission is granted to redistribute, sublicense, sell, or publish the
-software or derivative works until the copyright owner selects and adds a
-public release license.
+Copyright (c) 2026 the VoiceType Local Project Owner. All rights reserved.
+
+Permission is granted, free of charge, to any person obtaining a copy of this
+preview to download, run, inspect, copy, and modify it solely for personal,
+non-commercial evaluation, accessibility testing, education, and feedback.
+
+This permission does not include the right to sell, sublicense, redistribute
+outside the GitHub permissions described below, repackage, publish unofficial
+builds, provide the software as a paid service, use it for commercial gain, or
+remove copyright and license notices. Written permission from the Licensor is
+required for those activities.
+
+While the canonical repository is public, GitHub and GitHub users may exercise
+the platform rights required by the GitHub Terms of Service, including viewing
+and forking the repository within GitHub. Those platform rights do not grant a
+separate right to redistribute the software or builds elsewhere. Sharing a link
+to the canonical repository or its official release page is permitted.
+
+No external code contribution is accepted unless the Licensor and contributor
+first enter into a separate written contribution agreement. Unsolicited pull
+requests may be closed without review. See CONTRIBUTING.md.
+
+The Licensor may offer other versions under different, including commercial or
+open-source, terms.
 
 Third-party components remain governed by their respective licenses as listed
 in THIRD_PARTY_NOTICES.md.

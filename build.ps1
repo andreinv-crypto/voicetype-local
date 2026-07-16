@@ -75,7 +75,7 @@ if (Test-Path -LiteralPath $BundledComtypesTests) {
     Remove-Item -LiteralPath $BundledComtypesTests -Recurse -Force
 }
 Copy-Item -LiteralPath "THIRD_PARTY_NOTICES.md" -Destination (Join-Path $DistDirectory "VoiceType Local\THIRD_PARTY_NOTICES.md") -Force
-foreach ($Document in @("README.md", "PRIVACY.md", "SECURITY.md", "LICENSE")) {
+foreach ($Document in @("README.md", "RELEASE_NOTES_0.2.0-rc1.md", "PRIVACY.md", "SECURITY.md", "LICENSE", "CONTRIBUTING.md")) {
     if (Test-Path -LiteralPath $Document) {
         Copy-Item -LiteralPath $Document -Destination (Join-Path $DistDirectory "VoiceType Local\$Document") -Force
     }

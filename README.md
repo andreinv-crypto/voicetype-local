@@ -1,5 +1,9 @@
 # VoiceType Local
 
+[![Tests](https://github.com/andreinv-crypto/voicetype-local/actions/workflows/tests.yml/badge.svg)](https://github.com/andreinv-crypto/voicetype-local/actions/workflows/tests.yml)
+
+**Public preview:** [download VoiceType Local 0.2.0-rc1](https://github.com/andreinv-crypto/voicetype-local/releases/tag/v0.2.0-rc1)
+
 VoiceType Local — accessibility-first голосовой ввод для Windows 10/11.
 
 1. Поставьте курсор в любое текстовое поле.
@@ -13,7 +17,7 @@ VoiceType Local — accessibility-first голосовой ввод для Windo
 выключают запись. В настройках можно выбрать F8, F9, F10 или Pause для внешнего
 accessibility-переключателя.
 
-## Что реализовано в кандидате 0.2.0
+## Что реализовано в preview 0.2.0-rc1
 
 - полностью локальный Whisper `small`, CPU `int8`;
 - русский, испанский, английский и смешанная речь;
@@ -76,6 +80,13 @@ dist_candidate\VoiceType Local\VoiceType Local.exe
 после отдельного подтверждения через `install_candidate.ps1`. Есть автоматический
 rollback; подробнее в [docs/ROLLBACK.md](docs/ROLLBACK.md).
 
+## Готовая Windows-сборка
+
+На странице [предварительного релиза](https://github.com/andreinv-crypto/voicetype-local/releases/tag/v0.2.0-rc1)
+скачайте ZIP из раздела **Assets**, распакуйте его целиком и запустите
+`VoiceType Local\VoiceType Local.exe`. Сборка пока не подписана сертификатом;
+Windows SmartScreen может показать предупреждение.
+
 ## Evaluation
 
 В `eval/cases.json` есть 24 нейтральные контрольные фразы на русском, испанском,
@@ -89,9 +100,10 @@ rollback; подробнее в [docs/ROLLBACK.md](docs/ROLLBACK.md).
 
 ## Текущий статус
 
-Версия 0.2.0 пока является локальным кандидатом. Установленная стабильная 0.1.1
-остаётся доступной для rollback до завершения живого теста диктовки.
-
-Проект ещё не публикуется и временно сохраняет все права. Перед публичным
-релизом владелец выберет открытую или коммерческую лицензию, а также выполнит
-финальную проверку SBOM, FFmpeg/PyAV и code signing.
+Версия 0.2.0-rc1 публикуется как предварительная source-available сборка для
+личного некоммерческого тестирования. Это не финальный подписанный релиз.
+Коммерческое использование, перепродажа, перепаковка и распространение требуют
+письменного разрешения. Ссылкой на официальный репозиторий или релиз делиться
+можно; подробнее в [LICENSE](LICENSE). На этапе preview внешние фрагменты кода и
+pull request принимаются только после отдельного письменного соглашения — см.
+[CONTRIBUTING.md](CONTRIBUTING.md).
