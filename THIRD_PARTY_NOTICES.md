@@ -1,10 +1,11 @@
 # Third-party notices
 
-VoiceType Local 0.1.0 includes open-source runtime components. They remain under their own licenses; this notice does not replace the full license texts.
+VoiceType Local 0.2.0 includes open-source runtime components. They remain under their own licenses; this notice does not replace the full license texts.
 
 Core components:
 
 - faster-whisper 1.2.1 — MIT — https://github.com/SYSTRAN/faster-whisper
+- comtypes 1.4.16 — MIT — https://github.com/enthought/comtypes
 - CTranslate2 — MIT — https://github.com/OpenNMT/CTranslate2
 - OpenAI Whisper model / Systran faster-whisper-small conversion — MIT — https://huggingface.co/Systran/faster-whisper-small
 - ONNX Runtime — MIT — https://github.com/microsoft/onnxruntime
@@ -22,4 +23,3 @@ Core components:
 - certifi CA bundle — MPL-2.0 — https://github.com/certifi/python-certifi
 
 Before public or paid redistribution, produce a complete Software Bill of Materials, include every applicable full license text, confirm the exact PyAV/FFmpeg wheel configuration, and code-sign the executable.
-

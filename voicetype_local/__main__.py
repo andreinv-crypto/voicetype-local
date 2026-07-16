@@ -1,8 +1,11 @@
 import ctypes
+import multiprocessing
 import os
 import sys
+import tempfile
+from pathlib import Path
 
-from voicetype_local.app import run_app
+from voicetype_local.app import run_app, run_ui_smoke
 
 
 def _close_handle(handle: int) -> None:
@@ -32,6 +35,9 @@ def _self_test() -> int:
     from voicetype_local.audio import AudioRecorder
     from voicetype_local.config import Settings
     from voicetype_local.inserter import INPUT, UnicodeTextInserter
+    from voicetype_local.focus import FocusInspector
+    from voicetype_local.memory import MemoryStore
+    from voicetype_local.prompt_builder import PromptBuilder
     from voicetype_local.transcriber import OfflineTranscriber
 
     if ctypes.sizeof(INPUT) != 40:
@@ -39,15 +45,29 @@ def _self_test() -> int:
     if not AudioRecorder.input_devices():
         return 12
     UnicodeTextInserter()
-    OfflineTranscriber(Settings()).load()
+    FocusInspector().capture()
+    with tempfile.TemporaryDirectory(prefix="voicetype-self-test-") as directory:
+        memory = MemoryStore(Path(directory) / "memory.sqlite3", enable_fts=True)
+        try:
+            if not memory.integrity_check():
+                return 13
+            PromptBuilder().build_pre_asr(memory)
+        finally:
+            memory.close()
+    transcriber = OfflineTranscriber(Settings())
+    try:
+        transcriber.load()
+    finally:
+        transcriber.close()
     return 0
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     if "--self-test" in sys.argv:
         raise SystemExit(_self_test())
     if "--ui-smoke-test" in sys.argv:
-        run_app(3000)
+        run_ui_smoke()
         raise SystemExit(0)
     mutex = _single_instance()
     if mutex == 0:

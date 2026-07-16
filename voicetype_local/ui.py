@@ -138,6 +138,8 @@ class TrayController:
         on_exit: Callable[[], None],
         get_language: Callable[[], str],
         has_last_text: Callable[[], bool],
+        on_settings: Callable[[], None] | None = None,
+        on_memory: Callable[[], None] | None = None,
     ) -> None:
         self._get_language = get_language
         self._has_last_text = has_last_text
@@ -146,7 +148,7 @@ class TrayController:
             make_tray_image(STATUS_COLORS["loading"]),
             "VoiceType Local — загружается",
             menu=pystray.Menu(
-                pystray.MenuItem("Начать / остановить — Правый Ctrl", lambda *_: on_toggle()),
+                pystray.MenuItem("Начать / остановить диктовку", lambda *_: on_toggle()),
                 pystray.MenuItem("Отменить текущую запись", lambda *_: on_cancel()),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem(
@@ -167,6 +169,14 @@ class TrayController:
                     "Скопировать последний текст",
                     lambda *_: on_copy_last(),
                     enabled=lambda _: self._has_last_text(),
+                ),
+                pystray.MenuItem(
+                    "Память терминов…",
+                    lambda *_: on_memory() if on_memory is not None else None,
+                ),
+                pystray.MenuItem(
+                    "Настройки и приватность…",
+                    lambda *_: on_settings() if on_settings is not None else None,
                 ),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Выход", lambda *_: on_exit()),

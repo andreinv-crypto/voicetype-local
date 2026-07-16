@@ -12,6 +12,14 @@ KEYEVENTF_UNICODE = 0x0004
 ULONG_PTR = wintypes.WPARAM
 
 
+class TextInsertionError(RuntimeError):
+    """SendInput failure with an explicit partial-insertion safety signal."""
+
+    def __init__(self, message: str, *, partial: bool) -> None:
+        super().__init__(message)
+        self.partial = partial
+
+
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [
         ("wVk", wintypes.WORD),
@@ -76,13 +84,18 @@ class UnicodeTextInserter:
         array = array_type(*events)
         sent = self._send_input(len(events), array, ctypes.sizeof(INPUT))
         if sent != len(events):
-            raise ctypes.WinError(ctypes.get_last_error())
+            error = ctypes.WinError(ctypes.get_last_error())
+            raise TextInsertionError(
+                f"Windows inserted {sent} of {len(events)} keyboard events: {error}",
+                partial=sent > 0,
+            ) from error
 
     def insert(self, text: str) -> None:
         # Physical Enter can submit chats/forms and Tab can move focus. VoiceType
         # therefore inserts a safe single block in its first version.
         normalized = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
         events: list[INPUT] = []
+        prior_batch_sent = False
         for character in normalized:
             for unit in _unicode_units(character):
                 events.extend(
@@ -92,7 +105,18 @@ class UnicodeTextInserter:
                     ]
                 )
             if len(events) >= self.chunk_size * 2:
-                self._send(events)
+                try:
+                    self._send(events)
+                except TextInsertionError as exc:
+                    if prior_batch_sent and not exc.partial:
+                        raise TextInsertionError(str(exc), partial=True) from exc
+                    raise
+                prior_batch_sent = True
                 events.clear()
                 time.sleep(0.002)
-        self._send(events)
+        try:
+            self._send(events)
+        except TextInsertionError as exc:
+            if prior_batch_sent and not exc.partial:
+                raise TextInsertionError(str(exc), partial=True) from exc
+            raise

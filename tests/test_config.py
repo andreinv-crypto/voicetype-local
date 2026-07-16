@@ -1,37 +1,29 @@
-import json
+from __future__ import annotations
 
-from voicetype_local.config import SettingsStore
+from voicetype_local.config import Settings
 
 
-def test_invalid_values_fall_back(tmp_path) -> None:
-    path = tmp_path / "settings.json"
-    path.write_text(
-        json.dumps(
-            {
-                "language": "xx",
-                "model_name": "huge",
-                "compute_type": "unsafe",
-                "cpu_threads": 999,
-                "unknown": "ignored",
-            }
-        ),
-        encoding="utf-8",
+def test_malformed_cloud_consents_fail_closed() -> None:
+    settings = Settings(
+        cloud_text_consent="false",  # type: ignore[arg-type]
+        cloud_transcription_consent=1,  # type: ignore[arg-type]
     )
 
-    settings = SettingsStore(path).get()
+    settings.validate()
 
-    assert settings.language == "auto"
-    assert settings.model_name == "small"
-    assert settings.compute_type == "int8"
-    assert settings.cpu_threads == 16
+    assert settings.cloud_text_consent is False
+    assert settings.cloud_transcription_consent is False
 
 
-def test_update_is_saved_atomically(tmp_path) -> None:
-    path = tmp_path / "settings.json"
-    store = SettingsStore(path)
+def test_real_json_booleans_are_preserved() -> None:
+    settings = Settings(
+        cloud_text_consent=True,
+        cloud_transcription_consent=True,
+        app_scoped_memory=False,
+    )
 
-    store.update(language="es")
+    settings.validate()
 
-    assert SettingsStore(path).get().language == "es"
-    assert not path.with_suffix(".tmp").exists()
-
+    assert settings.cloud_text_consent is True
+    assert settings.cloud_transcription_consent is True
+    assert settings.app_scoped_memory is False

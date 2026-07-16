@@ -1,0 +1,127 @@
+{
+  "checksum": "50d9bdd41ef7809f5c9105c3fc1d264146c4324aeec88bca8685df123c353501",
+  "format": "voicetype-pack",
+  "pack": {
+    "enabled": false,
+    "language": "und",
+    "name": "Technology Core",
+    "pack_id": "technology-core.multilingual",
+    "source": "built_in_pack",
+    "terms": [
+      {
+        "aliases": [
+          {
+            "auto_replace": true,
+            "confirmed": true,
+            "match_type": "token_sequence",
+            "text": "chat g p t"
+          },
+          {
+            "auto_replace": true,
+            "confirmed": true,
+            "match_type": "token_sequence",
+            "text": "чат джи пи ти"
+          }
+        ],
+        "canonical_text": "ChatGPT",
+        "confirmed": true,
+        "enabled": true,
+        "kind": "product",
+        "language": "und",
+        "priority": 90,
+        "scopes": [
+          {
+            "type": "domain",
+            "value": "technology"
+          }
+        ]
+      },
+      {
+        "aliases": [
+          {
+            "auto_replace": true,
+            "confirmed": true,
+            "match_type": "token_sequence",
+            "text": "word press"
+          },
+          {
+            "auto_replace": true,
+            "confirmed": true,
+            "match_type": "token_sequence",
+            "text": "вордпресс"
+          }
+        ],
+        "canonical_text": "WordPress",
+        "confirmed": true,
+        "enabled": true,
+        "kind": "product",
+        "language": "und",
+        "priority": 80,
+        "scopes": [
+          {
+            "type": "domain",
+            "value": "technology"
+          }
+        ]
+      },
+      {
+        "aliases": [
+          {
+            "auto_replace": true,
+            "confirmed": true,
+            "match_type": "token_sequence",
+            "text": "post gres q l"
+          },
+          {
+            "auto_replace": true,
+            "confirmed": true,
+            "match_type": "token_sequence",
+            "text": "постгрес"
+          }
+        ],
+        "canonical_text": "PostgreSQL",
+        "confirmed": true,
+        "enabled": true,
+        "kind": "product",
+        "language": "und",
+        "priority": 80,
+        "scopes": [
+          {
+            "type": "domain",
+            "value": "technology"
+          }
+        ]
+      },
+      {
+        "aliases": [
+          {
+            "auto_replace": true,
+            "confirmed": true,
+            "match_type": "token_sequence",
+            "text": "open ai"
+          },
+          {
+            "auto_replace": true,
+            "confirmed": true,
+            "match_type": "token_sequence",
+            "text": "опен эй ай"
+          }
+        ],
+        "canonical_text": "OpenAI",
+        "confirmed": true,
+        "enabled": true,
+        "kind": "organization",
+        "language": "und",
+        "priority": 80,
+        "scopes": [
+          {
+            "type": "domain",
+            "value": "technology"
+          }
+        ]
+      }
+    ],
+    "version": "1.0.0"
+  },
+  "version": 1
+}

@@ -2,6 +2,7 @@
 build/
 build_candidate/
 dist/
+dist_candidate/
 dist_previous_*/
 dist_swap_*/
 models/
@@ -21,3 +22,10 @@ __pycache__/
 *.pfx
 *.p12
 *.lnk
+*.db
+*.dpapi
+*.flac
+*.m4a
+*.mp3
+*.ogg
+*.sqlite3

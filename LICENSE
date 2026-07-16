@@ -1,0 +1,20 @@
+VoiceType Local Source-Available Development License
+
+Copyright (c) 2026 VoiceType Local contributors. All rights reserved.
+
+This repository is currently under private product development. Permission is
+granted to the owner and explicitly authorized contributors to use, copy, and
+modify the software for development and testing.
+
+No permission is granted to redistribute, sublicense, sell, or publish the
+software or derivative works until the copyright owner selects and adds a
+public release license.
+
+Third-party components remain governed by their respective licenses as listed
+in THIRD_PARTY_NOTICES.md.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM USE OF
+THE SOFTWARE.

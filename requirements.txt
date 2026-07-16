@@ -1,4 +1,5 @@
 faster-whisper==1.2.1
+comtypes==1.4.16
 Pillow==12.3.0
 pynput==1.8.1
 pystray==0.19.5
