@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from tkinter import ttk
 from typing import Any
 
+from .config import is_supported_activation_pair
+
 
 LANGUAGE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("auto", "Автоматически"),
@@ -28,6 +30,43 @@ ACTIVATION_KEY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("f9", "F9"),
     ("f10", "F10"),
     ("pause", "Pause"),
+    ("ctrl+f8", "Ctrl + F8"),
+    ("ctrl+f9", "Ctrl + F9"),
+    ("ctrl+f10", "Ctrl + F10"),
+    ("alt+f8", "Alt + F8"),
+    ("alt+f9", "Alt + F9"),
+    ("alt+f10", "Alt + F10"),
+    ("shift+f8", "Shift + F8"),
+    ("shift+f9", "Shift + F9"),
+    ("shift+f10", "Shift + F10"),
+)
+
+ACTIVATION_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("toggle", "Нажал — включил, нажал ещё раз — выключил"),
+    ("hold", "Запись идёт, пока удерживаю клавишу"),
+)
+
+OVERLAY_SIZE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("compact", "Компактный"),
+    ("large", "Крупный"),
+    ("extra_large", "Очень крупный"),
+)
+
+OVERLAY_CONTRAST_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("standard", "Стандартный"),
+    ("high", "Высокий контраст"),
+)
+
+OVERLAY_POSITION_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("top", "Сверху"),
+    ("center", "По центру"),
+    ("bottom", "Снизу"),
+)
+
+INTERACTION_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("dictation", "Диктовка — печатать текст"),
+    ("commands", "Команды — управлять Windows"),
+    ("mixed", "Смешанный — команды со словом «команда»"),
 )
 
 CORRECTION_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -62,11 +101,16 @@ CLOUD_TRANSCRIPTION_WARNING = (
 
 
 __all__ = [
+    "ACTIVATION_MODE_OPTIONS",
     "ACTIVATION_KEY_OPTIONS",
     "CLOUD_TEXT_WARNING",
     "CLOUD_TRANSCRIPTION_WARNING",
     "CORRECTION_MODE_OPTIONS",
+    "INTERACTION_MODE_OPTIONS",
     "LANGUAGE_OPTIONS",
+    "OVERLAY_CONTRAST_OPTIONS",
+    "OVERLAY_POSITION_OPTIONS",
+    "OVERLAY_SIZE_OPTIONS",
     "PROVIDER_OPTIONS",
     "SettingsFormModel",
     "SettingsFormValues",
@@ -101,6 +145,14 @@ class SettingsFormValues:
 
     language: str = "auto"
     activation_key: str = "right_ctrl"
+    activation_mode: str = "toggle"
+    overlay_size: str = "large"
+    overlay_contrast: str = "high"
+    overlay_position: str = "top"
+    interaction_mode: str = "dictation"
+    dictation_commands_enabled: bool = True
+    remove_fillers: bool = False
+    automatic_spacing: bool = False
     sounds: bool = True
     correction_mode: str = "local_basic"
     transcription_mode: str = "local"
@@ -126,6 +178,36 @@ class SettingsFormValues:
                 ACTIVATION_KEY_OPTIONS,
                 "right_ctrl",
             ),
+            activation_mode=_valid_initial_choice(
+                _setting_value(settings, "activation_mode", "toggle"),
+                ACTIVATION_MODE_OPTIONS,
+                "toggle",
+            ),
+            overlay_size=_valid_initial_choice(
+                _setting_value(settings, "overlay_size", "large"),
+                OVERLAY_SIZE_OPTIONS,
+                "large",
+            ),
+            overlay_contrast=_valid_initial_choice(
+                _setting_value(settings, "overlay_contrast", "high"),
+                OVERLAY_CONTRAST_OPTIONS,
+                "high",
+            ),
+            overlay_position=_valid_initial_choice(
+                _setting_value(settings, "overlay_position", "top"),
+                OVERLAY_POSITION_OPTIONS,
+                "top",
+            ),
+            interaction_mode=_valid_initial_choice(
+                _setting_value(settings, "interaction_mode", "dictation"),
+                INTERACTION_MODE_OPTIONS,
+                "dictation",
+            ),
+            dictation_commands_enabled=_setting_bool(
+                settings, "dictation_commands_enabled", True
+            ),
+            remove_fillers=_setting_bool(settings, "remove_fillers", False),
+            automatic_spacing=_setting_bool(settings, "automatic_spacing", False),
             sounds=_setting_bool(settings, "sounds", True),
             correction_mode=_valid_initial_choice(
                 _setting_value(settings, "correction_mode", "local_basic"),
@@ -177,7 +259,14 @@ class SettingsFormModel:
         for name, value in changes.items():
             setattr(self.values, name, value)
 
-    def validation_errors(self, *, api_key_supplied: bool = False, can_save_secret: bool = True) -> dict[str, str]:
+    def validation_errors(
+        self,
+        *,
+        api_key_supplied: bool = False,
+        can_save_secret: bool = True,
+        has_saved_secret: bool = False,
+        require_cloud_secret: bool = False,
+    ) -> dict[str, str]:
         values = self.values
         errors: dict[str, str] = {}
         option_sets = (
@@ -185,7 +274,32 @@ class SettingsFormModel:
             (
                 "activation_key",
                 ACTIVATION_KEY_OPTIONS,
-                "Выберите одну клавишу включения из списка.",
+                "Выберите клавишу или безопасную комбинацию из списка.",
+            ),
+            (
+                "activation_mode",
+                ACTIVATION_MODE_OPTIONS,
+                "Выберите переключение или удержание.",
+            ),
+            (
+                "overlay_size",
+                OVERLAY_SIZE_OPTIONS,
+                "Выберите размер индикатора.",
+            ),
+            (
+                "overlay_contrast",
+                OVERLAY_CONTRAST_OPTIONS,
+                "Выберите контраст индикатора.",
+            ),
+            (
+                "overlay_position",
+                OVERLAY_POSITION_OPTIONS,
+                "Выберите положение индикатора.",
+            ),
+            (
+                "interaction_mode",
+                INTERACTION_MODE_OPTIONS,
+                "Выберите: диктовка, команды или смешанный режим.",
             ),
             (
                 "correction_mode",
@@ -202,6 +316,15 @@ class SettingsFormModel:
         for field, options, message in option_sets:
             if str(getattr(values, field)) not in {item[0] for item in options}:
                 errors[field] = message
+
+        if not is_supported_activation_pair(
+            values.activation_key, values.activation_mode
+        ) and values.activation_key == "pause" and values.activation_mode == "hold":
+            errors["activation_mode"] = (
+                "Pause работает только как переключатель: Windows не гарантирует "
+                "событие отпускания этой клавиши. Выберите «нажал — включил» или "
+                "другую клавишу для удержания."
+            )
 
         if values.correction_mode == "cloud_text" and not values.cloud_text_consent:
             errors["cloud_text_consent"] = (
@@ -244,6 +367,20 @@ class SettingsFormModel:
             errors["api_key"] = (
                 "Хранилище секретов не подключено: ключ не может быть сохранён безопасно."
             )
+        cloud_selected = (
+            values.correction_mode == "cloud_text"
+            or values.transcription_mode == "cloud_transcription"
+        )
+        if (
+            require_cloud_secret
+            and cloud_selected
+            and not api_key_supplied
+            and not has_saved_secret
+        ):
+            errors["api_key"] = (
+                "Для облачного режима сначала введите API-ключ. "
+                "Он сохранится только в защищённом хранилище Windows."
+            )
         return errors
 
     def changes(self) -> dict[str, object]:
@@ -254,6 +391,16 @@ class SettingsFormModel:
         return {
             "language": str(values.language),
             "activation_key": str(values.activation_key),
+            "activation_mode": str(values.activation_mode),
+            "overlay_size": str(values.overlay_size),
+            "overlay_contrast": str(values.overlay_contrast),
+            "overlay_position": str(values.overlay_position),
+            "interaction_mode": str(values.interaction_mode),
+            "dictation_commands_enabled": bool(
+                values.dictation_commands_enabled
+            ),
+            "remove_fillers": bool(values.remove_fillers),
+            "automatic_spacing": bool(values.automatic_spacing),
             "sounds": bool(values.sounds),
             "correction_mode": str(values.correction_mode),
             "transcription_mode": str(values.transcription_mode),
@@ -275,19 +422,36 @@ class SettingsFormModel:
         api_key: str,
         on_save: Callable[[dict[str, object]], object],
         save_secret: Callable[[str], object] | None = None,
+        has_saved_secret: bool = False,
     ) -> dict[str, object]:
         """Validate and save without ever returning or retaining the secret."""
 
         secret = str(api_key).strip()
         errors = self.validation_errors(
-            api_key_supplied=bool(secret), can_save_secret=save_secret is not None
+            api_key_supplied=bool(secret),
+            can_save_secret=save_secret is not None,
+            has_saved_secret=has_saved_secret,
+            require_cloud_secret=True,
         )
         if errors:
             raise SettingsValidationError(errors)
         changes = self.changes()
+        rollback_secret: Callable[[], object] | None = None
         if secret and save_secret is not None:
-            save_secret(secret)
-        on_save(dict(changes))
+            rollback = save_secret(secret)
+            if callable(rollback):
+                rollback_secret = rollback
+        try:
+            on_save(dict(changes))
+        except Exception:
+            if rollback_secret is not None:
+                try:
+                    rollback_secret()
+                except Exception:
+                    # Preserve the original settings error and never surface a
+                    # secret, encrypted bytes, or rollback path in the UI.
+                    pass
+            raise
         return dict(changes)
 
 
@@ -313,14 +477,34 @@ class SettingsWindow:
         *,
         on_save: Callable[[dict[str, object]], object],
         save_secret: Callable[[str], object] | None = None,
+        has_saved_secret: bool = False,
         delete_secret: Callable[[], object] | None = None,
         on_cancel: Callable[[], object] | None = None,
+        on_repeat_last: Callable[[], object] | None = None,
+        on_copy_last: Callable[[], object] | None = None,
+        on_copy_raw: Callable[[], object] | None = None,
+        on_clear_session: Callable[[], object] | None = None,
+        on_memory: Callable[[], object] | None = None,
+        on_help: Callable[[], object] | None = None,
+        has_last_text: bool = False,
+        has_raw_text: bool = False,
+        status_text: str = "Готово к работе",
     ) -> None:
         self.model = SettingsFormModel(settings)
         self._on_save_callback = on_save
         self._save_secret_callback = save_secret
+        self._has_saved_secret = bool(has_saved_secret)
         self._delete_secret_callback = delete_secret
         self._on_cancel_callback = on_cancel
+        self._on_repeat_last = on_repeat_last
+        self._on_copy_last = on_copy_last
+        self._on_copy_raw = on_copy_raw
+        self._on_clear_session = on_clear_session
+        self._on_memory = on_memory
+        self._on_help = on_help
+        self._has_last_text = bool(has_last_text)
+        self._has_raw_text = bool(has_raw_text)
+        self._main_status_text = str(status_text)[:120]
         self._closed = False
         self._delete_secret_pending = False
 
@@ -337,6 +521,7 @@ class SettingsWindow:
         self._configure_styles()
         self._create_variables()
         self._field_widgets: dict[str, tk.Misc] = {}
+        self._field_tabs: dict[str, tk.Misc] = {}
         self._build()
 
         self.window.update_idletasks()
@@ -386,6 +571,35 @@ class SettingsWindow:
         self._activation_var = tk.StringVar(
             self.window,
             _label_for(values.activation_key, ACTIVATION_KEY_OPTIONS),
+        )
+        self._activation_mode_var = tk.StringVar(
+            self.window,
+            _label_for(values.activation_mode, ACTIVATION_MODE_OPTIONS),
+        )
+        self._overlay_size_var = tk.StringVar(
+            self.window,
+            _label_for(values.overlay_size, OVERLAY_SIZE_OPTIONS),
+        )
+        self._overlay_contrast_var = tk.StringVar(
+            self.window,
+            _label_for(values.overlay_contrast, OVERLAY_CONTRAST_OPTIONS),
+        )
+        self._overlay_position_var = tk.StringVar(
+            self.window,
+            _label_for(values.overlay_position, OVERLAY_POSITION_OPTIONS),
+        )
+        self._interaction_mode_var = tk.StringVar(
+            self.window,
+            _label_for(values.interaction_mode, INTERACTION_MODE_OPTIONS),
+        )
+        self._dictation_commands_var = tk.BooleanVar(
+            self.window, values.dictation_commands_enabled
+        )
+        self._remove_fillers_var = tk.BooleanVar(
+            self.window, values.remove_fillers
+        )
+        self._automatic_spacing_var = tk.BooleanVar(
+            self.window, values.automatic_spacing
         )
         self._sounds_var = tk.BooleanVar(self.window, values.sounds)
         self._correction_var = tk.StringVar(
@@ -437,6 +651,670 @@ class SettingsWindow:
         return widget
 
     def _build(self) -> None:
+        """Build the selected five-section, accessibility-first interface."""
+
+        root = ttk.Frame(
+            self.window,
+            padding=(20, 16, 20, 14),
+            style="VoiceType.Settings.TFrame",
+        )
+        root.grid(row=0, column=0, sticky="nsew")
+        self.window.rowconfigure(0, weight=1)
+        self.window.columnconfigure(0, weight=1)
+        root.rowconfigure(2, weight=1)
+        root.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            root,
+            text="VoiceType Local",
+            style="VoiceType.Settings.Title.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            root,
+            text="Крупные понятные настройки · Tab — дальше · Enter — сохранить · Esc — отменить",
+            style="VoiceType.Settings.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 12))
+
+        notebook = ttk.Notebook(root, takefocus=True)
+        notebook.grid(row=2, column=0, sticky="nsew")
+        notebook.enable_traversal()
+        self._notebook = notebook
+
+        home = ttk.Frame(notebook, padding=20)
+        speech = ttk.Frame(notebook, padding=20)
+        text_tab = ttk.Frame(notebook, padding=20)
+        privacy = ttk.Frame(notebook, padding=20)
+        accessibility = ttk.Frame(notebook, padding=20)
+        for frame in (home, speech, text_tab, privacy, accessibility):
+            frame.columnconfigure(0, weight=1)
+            frame.columnconfigure(1, weight=1)
+        notebook.add(home, text="Главная")
+        notebook.add(speech, text="Речь")
+        notebook.add(text_tab, text="Текст")
+        notebook.add(privacy, text="Приватность")
+        notebook.add(accessibility, text="Доступность")
+
+        # Главная: only the controls needed every day.
+        status_card = ttk.LabelFrame(
+            home,
+            text="Состояние",
+            padding=16,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        status_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
+        status_card.columnconfigure(0, weight=1)
+        ttk.Label(
+            status_card,
+            text=f"● {self._main_status_text}",
+            font=("Segoe UI", 17, "bold"),
+            foreground="#15803D",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            status_card,
+            text="По умолчанию: правый Ctrl — начать, правый Ctrl ещё раз — закончить.",
+            font=("Segoe UI", 12),
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        home_settings = ttk.LabelFrame(
+            home,
+            text="Как слушать речь",
+            padding=10,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        home_settings.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        home_settings.columnconfigure(0, weight=1)
+        self._language_widget = self._combo(
+            home_settings,
+            0,
+            "Язык",
+            self._language_var,
+            LANGUAGE_OPTIONS,
+        )
+        self._interaction_mode_widget = self._combo(
+            home_settings,
+            2,
+            "Режим",
+            self._interaction_mode_var,
+            INTERACTION_MODE_OPTIONS,
+        )
+        ttk.Label(
+            home_settings,
+            text="В смешанном режиме управление начинается только со слова «команда», «command» или «comando».",
+            wraplength=390,
+            justify="left",
+            font=("Segoe UI", 11),
+        ).grid(row=4, column=0, sticky="w", padx=14, pady=(2, 10))
+
+        quick = ttk.LabelFrame(
+            home,
+            text="Быстрые действия",
+            padding=14,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        quick.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
+        quick.columnconfigure(0, weight=1)
+
+        def button(
+            parent: tk.Misc,
+            row: int,
+            title: str,
+            callback: Callable[[], object] | None,
+            *,
+            enabled: bool = True,
+            leave_window: bool = False,
+        ) -> ttk.Button:
+            command = (
+                (lambda: self._leave_for_action(callback))
+                if leave_window
+                else (lambda: self._call_optional(callback))
+            )
+            widget = ttk.Button(
+                parent,
+                text=title,
+                command=command,
+                takefocus=True,
+                style="VoiceType.Settings.TButton",
+            )
+            widget.grid(row=row, column=0, sticky="ew", pady=5)
+            if callback is None or not enabled:
+                widget.state(["disabled"])
+            return widget
+
+        repeat_button = button(
+            quick,
+            0,
+            "Повторить последнюю вставку",
+            self._on_repeat_last,
+            enabled=self._has_last_text,
+            leave_window=True,
+        )
+        copy_button = button(
+            quick,
+            1,
+            "Скопировать итог",
+            self._on_copy_last,
+            enabled=self._has_last_text,
+        )
+        copy_raw_button = button(
+            quick,
+            2,
+            "Скопировать исходный текст",
+            self._on_copy_raw,
+            enabled=self._has_raw_text,
+        )
+        button(
+            quick,
+            3,
+            "Что можно сказать",
+            self._on_help,
+            leave_window=True,
+        )
+
+        # Речь.
+        local_speech = ttk.LabelFrame(
+            speech,
+            text="Распознавание",
+            padding=12,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        local_speech.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        local_speech.columnconfigure(0, weight=1)
+        speech_language = self._combo(
+            local_speech, 0, "Язык распознавания", self._language_var, LANGUAGE_OPTIONS
+        )
+        transcription = self._combo(
+            local_speech,
+            2,
+            "Где распознавать",
+            self._transcription_var,
+            TRANSCRIPTION_MODE_OPTIONS,
+        )
+        ttk.Label(
+            local_speech,
+            text="Локальная модель: Whisper small · CPU int8\nМикрофон: системный по умолчанию\nБольшие модели не скачиваются автоматически.",
+            justify="left",
+            wraplength=390,
+            font=("Segoe UI", 12),
+        ).grid(row=4, column=0, sticky="w", padx=14, pady=12)
+
+        speech_cloud = ttk.LabelFrame(
+            speech,
+            text="Добровольное облачное распознавание",
+            padding=12,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        speech_cloud.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        speech_cloud.columnconfigure(0, weight=1)
+        ttk.Label(
+            speech_cloud,
+            text="Модель распознавания аудио",
+            style="VoiceType.Settings.TLabel",
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(10, 4))
+        transcription_model = ttk.Entry(
+            speech_cloud,
+            textvariable=self._transcription_model_var,
+            font=("Segoe UI", 14),
+            takefocus=True,
+        )
+        transcription_model.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 8))
+        ttk.Label(
+            speech_cloud,
+            text="Работает только вместе с отдельным разрешением на отправку аудио во вкладке «Приватность».",
+            style="VoiceType.Settings.Warning.TLabel",
+            wraplength=390,
+            justify="left",
+        ).grid(row=2, column=0, sticky="w", padx=14, pady=(2, 10))
+
+        # Текст.
+        correction_box = ttk.LabelFrame(
+            text_tab,
+            text="Коррекция",
+            padding=12,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        correction_box.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        correction_box.columnconfigure(0, weight=1)
+        correction = self._combo(
+            correction_box,
+            0,
+            "Режим коррекции",
+            self._correction_var,
+            CORRECTION_MODE_OPTIONS,
+        )
+        ttk.Label(
+            correction_box,
+            text="Бережный локальный режим исправляет пробелы, регистр, пунктуацию и очевидные повторы — без перефразирования.",
+            justify="left",
+            wraplength=390,
+            font=("Segoe UI", 11),
+        ).grid(row=2, column=0, sticky="w", padx=14, pady=(2, 8))
+        ttk.Label(
+            correction_box,
+            text="Локальная модель Ollama (только для compact / full)",
+            style="VoiceType.Settings.TLabel",
+        ).grid(row=3, column=0, sticky="w", padx=14, pady=(8, 4))
+        local_model = ttk.Entry(
+            correction_box,
+            textvariable=self._local_model_var,
+            font=("Segoe UI", 14),
+            takefocus=True,
+        )
+        local_model.grid(row=4, column=0, sticky="ew", padx=14, pady=(0, 8))
+
+        memory_box = ttk.LabelFrame(
+            text_tab,
+            text="Словарь и текущий результат",
+            padding=14,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        memory_box.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        memory_box.columnconfigure(0, weight=1)
+        button(
+            memory_box,
+            0,
+            "Открыть личный словарь",
+            self._on_memory,
+            leave_window=True,
+        )
+        button(
+            memory_box,
+            1,
+            "Скопировать исправленный текст",
+            self._on_copy_last,
+            enabled=self._has_last_text,
+        )
+        button(
+            memory_box,
+            2,
+            "Скопировать исходный текст",
+            self._on_copy_raw,
+            enabled=self._has_raw_text,
+        )
+        ttk.Label(
+            memory_box,
+            text="Исходный, словарный и итоговый варианты хранятся только в RAM до закрытия VoiceType.",
+            wraplength=390,
+            justify="left",
+            font=("Segoe UI", 11),
+        ).grid(row=3, column=0, sticky="w", pady=(10, 0))
+
+        dictation_box = ttk.LabelFrame(
+            text_tab,
+            text="Команды внутри диктовки",
+            padding=12,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        dictation_box.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(14, 0),
+        )
+        dictation_box.columnconfigure(0, weight=1)
+        dictation_commands = ttk.Checkbutton(
+            dictation_box,
+            text="Понимать «точка», «новая строка», «табуляция»",
+            variable=self._dictation_commands_var,
+            takefocus=True,
+            style="VoiceType.Settings.TCheckbutton",
+        )
+        dictation_commands.grid(row=0, column=0, sticky="w", padx=14, pady=(6, 3))
+        remove_fillers = ttk.Checkbutton(
+            dictation_box,
+            text="Убирать безопасные слова-паразиты: «эм», «ээ», “um”, “uh”, “eh”",
+            variable=self._remove_fillers_var,
+            takefocus=True,
+            style="VoiceType.Settings.TCheckbutton",
+        )
+        remove_fillers.grid(row=1, column=0, sticky="w", padx=14, pady=3)
+        automatic_spacing = ttk.Checkbutton(
+            dictation_box,
+            text="Добавлять пробел между диктовками в том же поле (до 30 секунд)",
+            variable=self._automatic_spacing_var,
+            takefocus=True,
+            style="VoiceType.Settings.TCheckbutton",
+        )
+        automatic_spacing.grid(row=2, column=0, sticky="w", padx=14, pady=(3, 6))
+
+        # Приватность.
+        consent_box = ttk.LabelFrame(
+            privacy,
+            text="Разрешения",
+            padding=12,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        consent_box.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        consent_box.columnconfigure(0, weight=1)
+        text_consent = ttk.Checkbutton(
+            consent_box,
+            text="Разрешить отправку текста в облако",
+            variable=self._cloud_text_var,
+            takefocus=True,
+            style="VoiceType.Settings.TCheckbutton",
+        )
+        text_consent.grid(row=0, column=0, sticky="w", padx=14, pady=(8, 2))
+        ttk.Label(
+            consent_box,
+            text=CLOUD_TEXT_WARNING,
+            style="VoiceType.Settings.Warning.TLabel",
+            wraplength=390,
+            justify="left",
+        ).grid(row=1, column=0, sticky="ew", padx=36, pady=(0, 8))
+        audio_consent = ttk.Checkbutton(
+            consent_box,
+            text="Разрешить отправку аудио в облако",
+            variable=self._cloud_audio_var,
+            takefocus=True,
+            style="VoiceType.Settings.TCheckbutton",
+        )
+        audio_consent.grid(row=2, column=0, sticky="w", padx=14, pady=(6, 2))
+        ttk.Label(
+            consent_box,
+            text=CLOUD_TRANSCRIPTION_WARNING,
+            style="VoiceType.Settings.Warning.TLabel",
+            wraplength=390,
+            justify="left",
+        ).grid(row=3, column=0, sticky="ew", padx=36, pady=(0, 8))
+        clear_button = button(
+            consent_box,
+            4,
+            "Очистить текст текущей сессии",
+            self._on_clear_session,
+            enabled=self._has_last_text or self._has_raw_text,
+        )
+
+        provider_box = ttk.LabelFrame(
+            privacy,
+            text="Провайдер и ключ",
+            padding=12,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        provider_box.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        provider_box.columnconfigure(0, weight=1)
+        provider = self._combo(
+            provider_box, 0, "Провайдер", self._provider_var, PROVIDER_OPTIONS
+        )
+        ttk.Label(
+            provider_box,
+            text="Модель облачной коррекции текста",
+            style="VoiceType.Settings.TLabel",
+        ).grid(row=2, column=0, sticky="w", padx=14, pady=(8, 4))
+        model = ttk.Entry(
+            provider_box,
+            textvariable=self._model_var,
+            font=("Segoe UI", 14),
+            takefocus=True,
+        )
+        model.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 8))
+        ttk.Label(
+            provider_box,
+            text="Новый API-ключ (пусто — не менять; существующий не показывается)",
+            style="VoiceType.Settings.TLabel",
+            wraplength=390,
+            justify="left",
+        ).grid(row=4, column=0, sticky="w", padx=14, pady=(8, 4))
+        api_key = ttk.Entry(
+            provider_box,
+            textvariable=self._api_key_var,
+            show="●",
+            font=("Segoe UI", 14),
+            takefocus=True,
+        )
+        api_key.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 8))
+        delete_key = ttk.Button(
+            provider_box,
+            text="Удалить сохранённый ключ (два нажатия)",
+            command=self.delete_saved_secret,
+            takefocus=True,
+        )
+        delete_key.grid(row=6, column=0, sticky="ew", padx=14, pady=(4, 8))
+
+        # Доступность.
+        activation_box = ttk.LabelFrame(
+            accessibility,
+            text="Способ запуска",
+            padding=12,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        activation_box.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        activation_box.columnconfigure(0, weight=1)
+        self._activation_widget = self._combo(
+            activation_box,
+            0,
+            "Клавиша или комбинация",
+            self._activation_var,
+            ACTIVATION_KEY_OPTIONS,
+        )
+        activation_mode = self._combo(
+            activation_box,
+            2,
+            "Как включать запись",
+            self._activation_mode_var,
+            ACTIVATION_MODE_OPTIONS,
+        )
+        ttk.Label(
+            activation_box,
+            text=(
+                "Стандарт: правый Ctrl и режим переключателя. Другую клавишу "
+                "или комбинацию можно выбрать здесь. Pause работает только "
+                "как переключатель."
+            ),
+            justify="left",
+            wraplength=390,
+            font=("Segoe UI", 11),
+        ).grid(row=4, column=0, sticky="w", padx=14, pady=(2, 8))
+        sounds = ttk.Checkbutton(
+            activation_box,
+            text="Воспроизводить звуковые сигналы",
+            variable=self._sounds_var,
+            takefocus=True,
+            style="VoiceType.Settings.TCheckbutton",
+        )
+        sounds.grid(row=5, column=0, sticky="w", padx=14, pady=(6, 8))
+        reset_accessibility = ttk.Button(
+            activation_box,
+            text="Вернуть настройки доступности по умолчанию",
+            command=self._reset_accessibility_defaults,
+            takefocus=True,
+            style="VoiceType.Settings.TButton",
+        )
+        reset_accessibility.grid(row=6, column=0, sticky="ew", padx=14, pady=(4, 10))
+
+        appearance_box = ttk.LabelFrame(
+            accessibility,
+            text="Индикатор записи",
+            padding=12,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        appearance_box.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        appearance_box.columnconfigure(0, weight=1)
+        overlay_size = self._combo(
+            appearance_box,
+            0,
+            "Размер",
+            self._overlay_size_var,
+            OVERLAY_SIZE_OPTIONS,
+        )
+        overlay_contrast = self._combo(
+            appearance_box,
+            2,
+            "Контраст",
+            self._overlay_contrast_var,
+            OVERLAY_CONTRAST_OPTIONS,
+        )
+        overlay_position = self._combo(
+            appearance_box,
+            4,
+            "Положение на экране",
+            self._overlay_position_var,
+            OVERLAY_POSITION_OPTIONS,
+        )
+        ttk.Label(
+            appearance_box,
+            text="Изменения применятся после сохранения. Настройки не влияют на распознавание речи.",
+            wraplength=390,
+            justify="left",
+            font=("Segoe UI", 11),
+        ).grid(row=6, column=0, sticky="w", padx=14, pady=(4, 10))
+
+        access_help = ttk.LabelFrame(
+            accessibility,
+            text="Голосовое управление",
+            padding=12,
+            style="VoiceType.Settings.TLabelframe",
+        )
+        access_help.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(14, 0),
+        )
+        access_help.columnconfigure(0, weight=1)
+        ttk.Label(
+            access_help,
+            text="Команды работают на русском, испанском и английском. Обычные действия выполняются сразу; опасные требуют подтверждения. UAC не обходится.",
+            wraplength=390,
+            justify="left",
+            font=("Segoe UI", 12),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 12))
+        button(
+            access_help,
+            1,
+            "Открыть справку команд",
+            self._on_help,
+            leave_window=True,
+        )
+
+        self._field_widgets.update(
+            {
+                "language": self._language_widget,
+                "activation_key": self._activation_widget,
+                "activation_mode": activation_mode,
+                "overlay_size": overlay_size,
+                "overlay_contrast": overlay_contrast,
+                "overlay_position": overlay_position,
+                "interaction_mode": self._interaction_mode_widget,
+                "dictation_commands_enabled": dictation_commands,
+                "remove_fillers": remove_fillers,
+                "automatic_spacing": automatic_spacing,
+                "sounds": sounds,
+                "correction_mode": correction,
+                "transcription_mode": transcription,
+                "cloud_text_consent": text_consent,
+                "cloud_transcription_consent": audio_consent,
+                "cloud_provider": provider,
+                "cloud_model": model,
+                "cloud_transcription_model": transcription_model,
+                "local_model": local_model,
+                "api_key": api_key,
+                "delete_api_key": delete_key,
+            }
+        )
+        self._field_tabs.update(
+            {
+                "language": home,
+                "interaction_mode": home,
+                "transcription_mode": speech,
+                "cloud_transcription_model": speech,
+                "correction_mode": text_tab,
+                "local_model": text_tab,
+                "dictation_commands_enabled": text_tab,
+                "remove_fillers": text_tab,
+                "automatic_spacing": text_tab,
+                "activation_key": accessibility,
+                "activation_mode": accessibility,
+                "overlay_size": accessibility,
+                "overlay_contrast": accessibility,
+                "overlay_position": accessibility,
+                "sounds": accessibility,
+                "cloud_text_consent": privacy,
+                "cloud_transcription_consent": privacy,
+                "cloud_provider": privacy,
+                "cloud_model": privacy,
+                "api_key": privacy,
+                "delete_api_key": privacy,
+            }
+        )
+
+        bottom = ttk.Frame(root, style="VoiceType.Settings.TFrame")
+        bottom.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        bottom.columnconfigure(0, weight=1)
+        ttk.Label(
+            bottom,
+            textvariable=self._status_var,
+            style="VoiceType.Settings.Status.TLabel",
+            wraplength=680,
+        ).grid(row=0, column=0, sticky="w")
+        save_button = ttk.Button(
+            bottom,
+            text="Сохранить (Enter)",
+            command=self.save,
+            takefocus=True,
+            style="VoiceType.Settings.TButton",
+        )
+        save_button.grid(row=0, column=1, padx=(10, 8))
+        ttk.Button(
+            bottom,
+            text="Отмена (Esc)",
+            command=self.cancel,
+            takefocus=True,
+            style="VoiceType.Settings.TButton",
+        ).grid(row=0, column=2)
+
+    def _call_optional(self, callback: Callable[[], object] | None) -> None:
+        """Run an in-window action without letting callback errors break Tk."""
+
+        if self._closed or callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            self._status_var.set(
+                "Не удалось выполнить действие. Попробуйте ещё раз."
+            )
+
+    def _reset_accessibility_defaults(self) -> None:
+        """Reset accessibility controls in the form without saving them."""
+
+        if self._closed:
+            return
+        self._activation_var.set(_label_for("right_ctrl", ACTIVATION_KEY_OPTIONS))
+        self._activation_mode_var.set(
+            _label_for("toggle", ACTIVATION_MODE_OPTIONS)
+        )
+        self._overlay_size_var.set(_label_for("large", OVERLAY_SIZE_OPTIONS))
+        self._overlay_contrast_var.set(
+            _label_for("high", OVERLAY_CONTRAST_OPTIONS)
+        )
+        self._overlay_position_var.set(
+            _label_for("top", OVERLAY_POSITION_OPTIONS)
+        )
+        self._sounds_var.set(True)
+        self._status_var.set(
+            "Настройки доступности возвращены к стандартным. Нажмите «Сохранить», чтобы применить."
+        )
+
+    def _leave_for_action(self, callback: Callable[[], object] | None) -> None:
+        """Release the modal settings window before opening another surface."""
+
+        if self._closed or callback is None:
+            return
+        # A typed secret must never survive after leaving the settings window.
+        self._api_key_var.set("")
+        try:
+            if self._on_cancel_callback is not None:
+                self._on_cancel_callback()
+        except Exception:
+            # Cleanup bookkeeping must not leave a modal grab behind or block
+            # the explicitly requested destination action.
+            pass
+        finally:
+            self.close()
+        callback()
+
+    def _build_legacy(self) -> None:
         shell = ttk.Frame(self.window, style="VoiceType.Settings.TFrame")
         shell.grid(row=0, column=0, sticky="nsew")
         self.window.rowconfigure(0, weight=1)
@@ -505,10 +1383,17 @@ class SettingsWindow:
         )
         self._activation_widget = self._combo(
             basic,
-            2,
+            4,
             "Единственная клавиша включения / выключения",
             self._activation_var,
             ACTIVATION_KEY_OPTIONS,
+        )
+        self._interaction_mode_widget = self._combo(
+            basic,
+            2,
+            "Что делать с распознанной речью",
+            self._interaction_mode_var,
+            INTERACTION_MODE_OPTIONS,
         )
         sounds = ttk.Checkbutton(
             basic,
@@ -517,17 +1402,17 @@ class SettingsWindow:
             takefocus=True,
             style="VoiceType.Settings.TCheckbutton",
         )
-        sounds.grid(row=4, column=0, sticky="w", padx=14, pady=10)
+        sounds.grid(row=6, column=0, sticky="w", padx=14, pady=10)
         correction = self._combo(
             basic,
-            5,
+            7,
             "Коррекция текста",
             self._correction_var,
             CORRECTION_MODE_OPTIONS,
         )
         transcription = self._combo(
             basic,
-            7,
+            9,
             "Распознавание речи",
             self._transcription_var,
             TRANSCRIPTION_MODE_OPTIONS,
@@ -637,6 +1522,7 @@ class SettingsWindow:
             {
                 "language": self._language_widget,
                 "activation_key": self._activation_widget,
+                "interaction_mode": self._interaction_mode_widget,
                 "sounds": sounds,
                 "correction_mode": correction,
                 "transcription_mode": transcription,
@@ -719,6 +1605,24 @@ class SettingsWindow:
             activation_key=_value_for(
                 self._activation_var.get(), ACTIVATION_KEY_OPTIONS
             ),
+            activation_mode=_value_for(
+                self._activation_mode_var.get(), ACTIVATION_MODE_OPTIONS
+            ),
+            overlay_size=_value_for(
+                self._overlay_size_var.get(), OVERLAY_SIZE_OPTIONS
+            ),
+            overlay_contrast=_value_for(
+                self._overlay_contrast_var.get(), OVERLAY_CONTRAST_OPTIONS
+            ),
+            overlay_position=_value_for(
+                self._overlay_position_var.get(), OVERLAY_POSITION_OPTIONS
+            ),
+            interaction_mode=_value_for(
+                self._interaction_mode_var.get(), INTERACTION_MODE_OPTIONS
+            ),
+            dictation_commands_enabled=self._dictation_commands_var.get(),
+            remove_fillers=self._remove_fillers_var.get(),
+            automatic_spacing=self._automatic_spacing_var.get(),
             sounds=self._sounds_var.get(),
             correction_mode=_value_for(
                 self._correction_var.get(), CORRECTION_MODE_OPTIONS
@@ -738,6 +1642,12 @@ class SettingsWindow:
         field, message = next(iter(error.errors.items()))
         self._status_var.set(message)
         widget = self._field_widgets.get(field)
+        tab = self._field_tabs.get(field)
+        if tab is not None:
+            try:
+                self._notebook.select(tab)
+            except tk.TclError:
+                pass
         if widget is not None:
             widget.focus_set()
 
@@ -750,6 +1660,7 @@ class SettingsWindow:
                 api_key=self._api_key_var.get(),
                 on_save=self._on_save_callback,
                 save_secret=self._save_secret_callback,
+                has_saved_secret=self._has_saved_secret,
             )
         except SettingsValidationError as exc:
             self._show_validation_error(exc)
@@ -822,8 +1733,18 @@ def open_settings_window(
     *,
     on_save: Callable[[dict[str, object]], object],
     save_secret: Callable[[str], object] | None = None,
+    has_saved_secret: bool = False,
     delete_secret: Callable[[], object] | None = None,
     on_cancel: Callable[[], object] | None = None,
+    on_repeat_last: Callable[[], object] | None = None,
+    on_copy_last: Callable[[], object] | None = None,
+    on_copy_raw: Callable[[], object] | None = None,
+    on_clear_session: Callable[[], object] | None = None,
+    on_memory: Callable[[], object] | None = None,
+    on_help: Callable[[], object] | None = None,
+    has_last_text: bool = False,
+    has_raw_text: bool = False,
+    status_text: str = "Готово к работе",
 ) -> SettingsWindow:
     """Explicitly create the window; importing the module has no UI effect."""
 
@@ -832,6 +1753,16 @@ def open_settings_window(
         settings,
         on_save=on_save,
         save_secret=save_secret,
+        has_saved_secret=has_saved_secret,
         delete_secret=delete_secret,
         on_cancel=on_cancel,
+        on_repeat_last=on_repeat_last,
+        on_copy_last=on_copy_last,
+        on_copy_raw=on_copy_raw,
+        on_clear_session=on_clear_session,
+        on_memory=on_memory,
+        on_help=on_help,
+        has_last_text=has_last_text,
+        has_raw_text=has_raw_text,
+        status_text=status_text,
     )

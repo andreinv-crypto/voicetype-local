@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import time
+import unicodedata
 from ctypes import wintypes
 
 
@@ -91,9 +92,20 @@ class UnicodeTextInserter:
             ) from error
 
     def insert(self, text: str) -> None:
-        # Physical Enter can submit chats/forms and Tab can move focus. VoiceType
-        # therefore inserts a safe single block in its first version.
-        normalized = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        # Preserve dictated layout as Unicode text. CRLF is normalized first so
+        # Windows line endings never become two line breaks; neither newline nor
+        # tab is emitted as a physical VK_RETURN/VK_TAB key event.
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        if any(
+            character not in {"\n", "\t"}
+            and not character.isprintable()
+            and unicodedata.category(character) != "Cf"
+            for character in normalized
+        ):
+            raise TextInsertionError(
+                "Text contains an unsupported control or surrogate character",
+                partial=False,
+            )
         events: list[INPUT] = []
         prior_batch_sent = False
         for character in normalized:

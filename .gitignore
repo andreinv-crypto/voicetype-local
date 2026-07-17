@@ -10,11 +10,13 @@ release/
 .agents/
 startup_backups/
 .pytest_cache/
+.pytest*/
 __pycache__/
 *.py[cod]
 *.log
 *.log.*
 *.spec
+!VoiceType Local.spec
 .env
 .env.*
 *.wav

@@ -26,6 +26,30 @@ def test_secret_store_never_writes_plaintext(tmp_path) -> None:
     assert store.get("openai_api_key") is None
 
 
+def test_secret_rollback_restores_previous_encrypted_blob(tmp_path) -> None:
+    store = DpapiSecretStore(tmp_path, _Protector())
+    store.set("openai_api_key", "old-secret")
+    path = tmp_path / "openai_api_key.dpapi"
+    previous_blob = path.read_bytes()
+
+    rollback = store.set_with_rollback("openai_api_key", "new-secret")
+    assert store.get("openai_api_key") == "new-secret"
+    rollback()
+    rollback()
+
+    assert path.read_bytes() == previous_blob
+    assert store.get("openai_api_key") == "old-secret"
+
+
+def test_secret_rollback_removes_new_file_when_no_previous_secret(tmp_path) -> None:
+    store = DpapiSecretStore(tmp_path, _Protector())
+
+    rollback = store.set_with_rollback("openai_api_key", "new-secret")
+    rollback()
+
+    assert not (tmp_path / "openai_api_key.dpapi").exists()
+
+
 @pytest.mark.parametrize("name", ["../key", "A KEY", "", "x" * 65])
 def test_secret_names_cannot_escape_directory(tmp_path, name: str) -> None:
     store = DpapiSecretStore(tmp_path, _Protector())

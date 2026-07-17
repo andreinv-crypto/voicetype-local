@@ -22,6 +22,8 @@ $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $Python)) {
     throw "Run setup.ps1 first."
 }
+& $Python scripts\packaged_control_self_test.py
+if ($LASTEXITCODE -ne 0) { throw "VoiceType Control packaging preflight failed." }
 if (-not (Test-Path -LiteralPath "models\small\model.bin")) {
     throw "Offline model is missing. Run setup.ps1 first."
 }
@@ -50,8 +52,15 @@ if ($LASTEXITCODE -ne 0) { throw "Icon generation failed." }
     --collect-all av `
     --collect-all sounddevice `
     --collect-all comtypes `
+    --collect-all uiautomation `
+    --copy-metadata uiautomation `
     --hidden-import pystray._win32 `
     --hidden-import pynput.keyboard._win32 `
+    --hidden-import voicetype_local.packaged_self_test `
+    --hidden-import voicetype_local.windows_control `
+    --hidden-import voicetype_local.voice_control `
+    --hidden-import voicetype_local.voice_commands `
+    --hidden-import voicetype_local.dictation_transform `
     --exclude-module IPython `
     --exclude-module _pytest `
     --exclude-module comtypes.test `

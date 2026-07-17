@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from .text_rules import validate_protected_tokens
+from .text_rules import extract_protected_tokens, validate_protected_tokens
 
 
 GENTLE_CORRECTION_INSTRUCTIONS = """\
@@ -28,7 +28,16 @@ Return only the response required by the supplied JSON schema.
 OPENAI_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses"
 
 
-_URL_RE = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>]+")
+_URL_RE = re.compile(
+    r"(?i)(?<![\w@])(?:"
+    r"(?:https?://|www\.)[^\s<>]+|"
+    r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
+    r"(?:com|org|net|edu|gov|io|ai|app|dev|co|me|info|biz|cloud|"
+    r"online|site|tech|xyz|us|uk|es|ru|de|fr|it|pt|eu)"
+    r"(?![a-z0-9-])"
+    r"(?:/[^\s<>]*)?"
+    r")"
+)
 _EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
 _NUMBER_RE = re.compile(
     r"(?<!\w)(?:[$€£]\s*)?[+-]?\d(?:[\d .,'’]*\d)?(?:\s*%|\s*[$€£])?(?!\w)"
@@ -37,6 +46,183 @@ _CODE_RE = re.compile(
     r"(?iu)\b(?=[A-ZА-ЯЁ0-9/_-]{3,}\b)(?=[A-ZА-ЯЁ0-9/_-]*\d)"
     r"[A-ZА-ЯЁ0-9]+(?:[\-_/][A-ZА-ЯЁ0-9]+)+\b"
 )
+_TIME_RE = re.compile(
+    r"(?<!\w)(?:[01]?\d|2[0-3]):[0-5]\d(?:[:][0-5]\d)?(?!\w)"
+)
+_ABBREVIATION_RE = re.compile(
+    r"(?u)(?<!\w)(?:[^\W\d_]\.){2,}|"
+    r"(?<!\w)[A-ZÁÉÍÓÚÜÑА-ЯЁ]{2,}(?!\w)"
+)
+_WORD_PATTERN = r"[^\W_]+"
+_PLACEHOLDER_START = 0xE000
+_PLACEHOLDER_END = 0xF8FF
+
+
+def _trim_url_span(text: str, start: int, end: int) -> tuple[int, int]:
+    while end > start and text[end - 1] in ".,;:!?)]}":
+        end -= 1
+    return start, end
+
+
+def _protected_spans_for_typography(
+    text: str,
+    protected_terms: Sequence[str],
+) -> tuple[tuple[int, int], ...]:
+    candidates = [
+        (item.start, item.end)
+        for item in extract_protected_tokens(
+            text,
+            protected_terms=protected_terms,
+        )
+    ]
+    for match in _URL_RE.finditer(text):
+        candidates.append(_trim_url_span(text, *match.span()))
+    for pattern in (_TIME_RE, _ABBREVIATION_RE):
+        candidates.extend(match.span() for match in pattern.finditer(text))
+
+    # Prefer the longest token when two detectors overlap (for example a
+    # number inside a URL). The accepted spans never overlap, which makes the
+    # masking/restoration pass deterministic.
+    candidates = [item for item in candidates if item[1] > item[0]]
+    candidates.sort(key=lambda item: (item[0], -(item[1] - item[0]), item[1]))
+    accepted: list[tuple[int, int]] = []
+    for start, end in candidates:
+        if any(start < other_end and end > other_start for other_start, other_end in accepted):
+            continue
+        accepted.append((start, end))
+    accepted.sort()
+    return tuple(accepted)
+
+
+def _mask_protected_typography(
+    text: str,
+    protected_terms: Sequence[str],
+) -> tuple[str, dict[str, str]]:
+    spans = _protected_spans_for_typography(text, protected_terms)
+    if not spans:
+        return text, {}
+
+    used = set(text)
+    replacements: dict[str, str] = {}
+    pieces: list[str] = []
+    cursor = 0
+    codepoint = _PLACEHOLDER_START
+    for start, end in spans:
+        while codepoint <= _PLACEHOLDER_END and chr(codepoint) in used:
+            codepoint += 1
+        if codepoint > _PLACEHOLDER_END:
+            # A transcript containing the complete private-use range is not a
+            # realistic dictation. Failing closed is still safer than editing
+            # a protected token in such malformed input.
+            return text, {}
+        placeholder = chr(codepoint)
+        codepoint += 1
+        pieces.append(text[cursor:start])
+        pieces.append(placeholder)
+        replacements[placeholder] = text[start:end]
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces), replacements
+
+
+def _restore_protected_typography(text: str, replacements: Mapping[str, str]) -> str:
+    for placeholder, value in replacements.items():
+        text = text.replace(placeholder, value)
+    return text
+
+
+def _replace_until_stable(pattern: re.Pattern[str], text: str) -> str:
+    while True:
+        updated, count = pattern.subn(r"\g<value>", text)
+        if not count:
+            return text
+        text = updated
+
+
+def _remove_adjacent_repetitions(text: str) -> str:
+    """Collapse only exact repetitions separated by horizontal whitespace.
+
+    Punctuation breaks a candidate deliberately: ``yes, yes`` may be
+    rhetorical, while ``yes yes`` is the common ASR/stutter failure this local
+    rule is intended to repair. Phrases are limited to four words.
+    """
+
+    for word_count in range(4, 1, -1):
+        pattern = re.compile(
+            rf"(?iu)(?<!\w)(?P<value>{_WORD_PATTERN}"
+            rf"(?:[ \t]+{_WORD_PATTERN}){{{word_count - 1}}})"
+            rf"[ \t]+(?P=value)(?!\w)"
+        )
+        text = _replace_until_stable(pattern, text)
+    word_pattern = re.compile(
+        rf"(?iu)(?<!\w)(?P<value>{_WORD_PATTERN})[ \t]+(?P=value)(?!\w)"
+    )
+    return _replace_until_stable(word_pattern, text)
+
+
+def _normalize_punctuation_spacing(text: str) -> str:
+    text = re.sub(r"[^\S\r\n]+", " ", text)
+    text = re.sub(r"[ \t]+([,.;:!?])", r"\1", text)
+    next_token = r"(?=[^\W_]|[\uE000-\uF8FF])"
+    text = re.sub(rf"([,;:]){next_token}", r"\1 ", text)
+    text = re.sub(rf"([.!?]+){next_token}", r"\1 ", text)
+    text = re.sub(
+        r"[ \t]*(\r\n|\r|\n)[ \t]*",
+        lambda match: match.group(1),
+        text,
+    )
+    return text.strip(" \t")
+
+
+def _capitalize_sentence_starts(text: str, placeholders: set[str]) -> str:
+    result: list[str] = []
+    capitalize_next = True
+    opening_characters = set("\"'«“„([{¿¡—–-")
+    for character in text:
+        if character in placeholders:
+            result.append(character)
+            if capitalize_next:
+                capitalize_next = False
+            continue
+        if capitalize_next:
+            if character.isalpha():
+                upper = character.upper()
+                result.append(upper if len(upper) == 1 else character)
+                capitalize_next = False
+                continue
+            if character.isdigit():
+                capitalize_next = False
+            elif character.isspace() or character in opening_characters:
+                pass
+            elif character not in ".!?":
+                # Other leading punctuation should not consume the next word.
+                pass
+        result.append(character)
+        if character in ".!?" or character in "\r\n":
+            capitalize_next = True
+    return "".join(result)
+
+
+def gentle_correct_text(
+    text: str,
+    protected_terms: Sequence[str] = (),
+) -> str:
+    """Apply deterministic, multilingual, presentation-only corrections.
+
+    The function never adds final punctuation or guesses sentence boundaries.
+    Values with semantic importance are replaced by private placeholders before
+    spacing, repeat, and capitalization rules run, then restored byte-for-byte.
+    """
+
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    masked, replacements = _mask_protected_typography(text, protected_terms)
+    if not replacements and _protected_spans_for_typography(text, protected_terms):
+        return text
+    masked = _remove_adjacent_repetitions(masked)
+    masked = _normalize_punctuation_spacing(masked)
+    masked = _capitalize_sentence_starts(masked, set(replacements))
+    return _restore_protected_typography(masked, replacements)
 
 
 def protected_tokens(text: str, protected_terms: Sequence[str] = ()) -> Counter[str]:
@@ -49,8 +235,8 @@ def protected_tokens(text: str, protected_terms: Sequence[str] = ()) -> Counter[
     folded = text.casefold()
     for term in protected_terms:
         clean = str(term).strip()
-        if clean and clean.casefold() in folded:
-            values.append(clean)
+        if clean:
+            values.extend([clean] * folded.count(clean.casefold()))
     return Counter(values)
 
 
@@ -76,12 +262,13 @@ def validate_conservative_change(
     original_words = re.findall(r"(?u)\w+", original.casefold())
     corrected_words = re.findall(r"(?u)\w+", corrected.casefold())
     if original_words != corrected_words:
-        collapsed_original = [
-            word
-            for index, word in enumerate(original_words)
-            if index == 0 or word != original_words[index - 1]
-        ]
-        if collapsed_original != corrected_words:
+        masked, replacements = _mask_protected_typography(original, protected_terms)
+        collapsed_original = _restore_protected_typography(
+            _remove_adjacent_repetitions(masked),
+            replacements,
+        )
+        collapsed_words = re.findall(r"(?u)\w+", collapsed_original.casefold())
+        if collapsed_words != corrected_words:
             return False
     original_length = max(1, len(original.strip()))
     ratio = len(corrected.strip()) / original_length
@@ -161,10 +348,14 @@ class LocalBasicCorrector:
         self,
         normalizer: Callable[[str], str] | None = None,
     ) -> None:
-        self._normalizer = normalizer or (lambda value: value)
+        self._normalizer = normalizer
 
     def correct(self, text: str, context: CorrectionContext) -> CorrectionResult:
-        corrected = self._normalizer(text)
+        corrected = (
+            gentle_correct_text(text, context.terms)
+            if self._normalizer is None
+            else self._normalizer(text)
+        )
         if not validate_conservative_change(text, corrected, context.terms):
             return CorrectionResult(
                 text=text,

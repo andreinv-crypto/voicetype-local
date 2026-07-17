@@ -1,0 +1,4 @@
+# Security-sensitive UI Automation dependency used by VoiceType Control.
+# Keep this exact wheel hash in sync with docs/DEPENDENCY_REVIEW_UIAUTOMATION.md.
+uiautomation==2.0.29 \
+    --hash=sha256:5dd51c9e77e70470142a13d903be67f256c445e7cf20b47ada0ece2bdaff9f32

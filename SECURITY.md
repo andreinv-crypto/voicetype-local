@@ -32,6 +32,26 @@ data only.
 - Dependencies and packaged artifacts must be audited before a release.
 - External memory packs are untrusted until their source/signature is verified;
   importing or enabling them always requires an explicit user action.
+- The Windows Control plane must never pass recognized speech to a shell,
+  command interpreter, executable path, URL launcher or free-form automation
+  agent. It accepts only typed intents and arguments from closed allowlists.
+- Dictation is deliberately different: it types text into the field explicitly
+  focused by the user. VoiceType does not interpret that text as a command and
+  never adds a physical Enter/Tab action. A user who deliberately focuses a
+  terminal remains responsible for the text they insert there.
+- Terminal, administrator/UAC and secure-desktop operations are denied in the
+  Control plane. VoiceType must not attempt privilege escalation or UIAccess
+  bypasses.
+- Sensitive and destructive UI actions require a short-lived confirmation bound
+  to the exact typed request. A stale or different confirmation fails closed.
+- UI Automation snapshots contain immutable metadata only. Live COM controls
+  stay inside their initialized worker thread; numbered invocation must
+  re-enumerate and verify foreground window, identity, role, name and bounds.
+- Command diagnostics may contain intent/result/backend/duration only; spoken
+  text, accessible names, window titles, paths and document content are banned.
 
 Before each public release, scan the reachable Git history and the packaged
 artifact for secrets, personal paths, runtime data, and unexpected files.
+
+The implementation status and remaining release gates are tracked in
+[docs/IMPLEMENTATION_STATUS_2026-07-17.md](docs/IMPLEMENTATION_STATUS_2026-07-17.md).

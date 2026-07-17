@@ -8,6 +8,7 @@ from voicetype_local.correction import (
     LocalBasicCorrector,
     OllamaCorrector,
     OpenAIResponsesCorrector,
+    gentle_correct_text,
     protected_tokens,
     validate_conservative_change,
 )
@@ -64,6 +65,71 @@ def test_conservative_validation_rejects_semantic_or_negation_changes() -> None:
 def test_conservative_validation_allows_punctuation_case_and_repeat_cleanup() -> None:
     assert validate_conservative_change("привет мир", "Привет, мир!")
     assert validate_conservative_change("да да, готово", "Да, готово.")
+    assert validate_conservative_change(
+        "мы сегодня мы сегодня начинаем",
+        "Мы сегодня начинаем.",
+    )
+
+
+def test_default_local_basic_corrects_typography_in_ru_es_and_en() -> None:
+    provider = LocalBasicCorrector()
+    examples = (
+        ("  привет ,мир!как дела  ", "ru", "Привет, мир! Как дела"),
+        ("hola ,mundo.esto funciona", "es", "Hola, mundo. Esto funciona"),
+        ("hello ,world!this works", "en", "Hello, world! This works"),
+    )
+    for source, language, expected in examples:
+        result = provider.correct(source, CorrectionContext(language=language))
+        assert result.text == expected
+        assert result.changed
+
+
+def test_default_local_basic_removes_only_exact_unpunctuated_adjacent_repeats() -> None:
+    provider = LocalBasicCorrector()
+    result = provider.correct(
+        "я я думаю мы сегодня мы сегодня начинаем",
+        CorrectionContext(language="ru"),
+    )
+    assert result.text == "Я думаю мы сегодня начинаем"
+
+    rhetorical = provider.correct(
+        "да, да, начинаем",
+        CorrectionContext(language="ru"),
+    )
+    assert rhetorical.text == "Да, да, начинаем"
+
+
+def test_default_local_basic_preserves_protected_values_byte_for_byte() -> None:
+    source = (
+        "пиши WordPress WordPress на a@b.es ,открой example.com/a,b . "
+        "код AB-123 ,встреча 17.07.2026 в 12:30 . API и т.е. готовы"
+    )
+    result = LocalBasicCorrector().correct(
+        source,
+        CorrectionContext(language="ru", terms=("WordPress",)),
+    )
+    for token in (
+        "WordPress WordPress",
+        "a@b.es",
+        "example.com/a,b",
+        "AB-123",
+        "17.07.2026",
+        "12:30",
+        "API",
+        "т.е.",
+    ):
+        assert token in result.text
+    assert "example. com" not in result.text
+    assert "12: 30" not in result.text
+
+
+def test_gentle_correct_text_is_idempotent_and_does_not_add_final_punctuation() -> None:
+    source = "привет   мир!как  дела"
+    once = gentle_correct_text(source)
+    twice = gentle_correct_text(once)
+    assert once == "Привет мир! Как дела"
+    assert twice == once
+    assert not once.endswith((".", "!", "?"))
 
 
 def test_local_pipeline_falls_back_when_rule_damages_a_code() -> None:

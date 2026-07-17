@@ -32,6 +32,12 @@ def _single_instance() -> int | None:
 
 def _self_test() -> int:
     """Exercise packaged native dependencies without opening the UI or microphone."""
+    from voicetype_local.packaged_self_test import run_packaged_control_self_test
+
+    control_code, _control_label = run_packaged_control_self_test()
+    if control_code:
+        return control_code
+
     from voicetype_local.audio import AudioRecorder
     from voicetype_local.config import Settings
     from voicetype_local.inserter import INPUT, UnicodeTextInserter
