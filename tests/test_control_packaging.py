@@ -25,6 +25,13 @@ def _fake_modules() -> dict[str, object]:
         "voicetype_local.dictation_transform": SimpleNamespace(
             transform_dictation=lambda _text: None
         ),
+        "voicetype_local.session_editing": SimpleNamespace(
+            SessionEditCommandParser=object
+        ),
+        "voicetype_local.session_editor": SimpleNamespace(SessionTextEditor=object),
+        "voicetype_local.windows_session_editor_probe": SimpleNamespace(
+            run_isolated_session_editor_probe=lambda: (0, "ok")
+        ),
     }
 
 

@@ -11,6 +11,8 @@ control route.
 import enum
 from dataclasses import dataclass
 
+from .dictation_actions import DictationEndAction, extract_dictation_end_action
+from .session_editing import SessionEditCommandParser, SessionEditRequest
 from .voice_commands import (
     CommandIntent,
     CommandLanguage,
@@ -26,6 +28,8 @@ from .windows_control import CanonicalIntent, ControlRequest, Sensitivity
 class VoiceRouteKind(enum.StrEnum):
     EMPTY = "empty"
     DICTATION = "dictation"
+    DICTATION_THEN_CONTROL = "dictation_then_control"
+    SESSION_EDIT = "session_edit"
     REJECTED = "rejected"
     CONTROL = "control"
     HELP = "help"
@@ -43,15 +47,50 @@ class VoiceRoute:
     request: ControlRequest | None = None
     reason_code: str | None = None
     risk: CommandRisk | None = None
+    action_code: str | None = None
+    edit_request: SessionEditRequest | None = None
 
     def __post_init__(self) -> None:
         if self.kind is VoiceRouteKind.DICTATION:
-            if self.dictation_text is None or self.request is not None:
+            if (
+                self.dictation_text is None
+                or self.request is not None
+                or self.action_code is not None
+                or self.edit_request is not None
+            ):
                 raise ValueError("dictation routes contain text only")
+        elif self.kind is VoiceRouteKind.DICTATION_THEN_CONTROL:
+            if (
+                not self.dictation_text
+                or self.request is None
+                or not self.action_code
+                or self.edit_request is not None
+            ):
+                raise ValueError(
+                    "compound dictation routes require text, action, and request"
+                )
         elif self.kind is VoiceRouteKind.CONTROL:
-            if self.request is None or self.dictation_text is not None:
+            if (
+                self.request is None
+                or self.dictation_text is not None
+                or self.action_code is not None
+                or self.edit_request is not None
+            ):
                 raise ValueError("control routes contain a canonical request only")
-        elif self.dictation_text is not None or self.request is not None:
+        elif self.kind is VoiceRouteKind.SESSION_EDIT:
+            if (
+                self.edit_request is None
+                or self.dictation_text is not None
+                or self.request is not None
+                or self.action_code is not None
+            ):
+                raise ValueError("session edit routes contain one typed edit only")
+        elif (
+            self.dictation_text is not None
+            or self.request is not None
+            or self.action_code is not None
+            or self.edit_request is not None
+        ):
             raise ValueError("local/rejected routes cannot retain speech or requests")
 
 
@@ -139,8 +178,13 @@ def _control_request(
 class VoiceControlRouter:
     """Stateless, testable routing for Dictation / Commands / Mixed modes."""
 
-    def __init__(self, parser: VoiceCommandParser | None = None) -> None:
+    def __init__(
+        self,
+        parser: VoiceCommandParser | None = None,
+        session_edit_parser: SessionEditCommandParser | None = None,
+    ) -> None:
         self.parser = parser or VoiceCommandParser()
+        self.session_edit_parser = session_edit_parser or SessionEditCommandParser()
 
     def route(
         self,
@@ -154,10 +198,43 @@ class VoiceControlRouter:
             command_language = CommandLanguage(language)
         except ValueError:
             command_language = CommandLanguage.AUTO
+        edit = self.session_edit_parser.parse(
+            text,
+            mode=mode,
+            language=command_language,
+        )
+        if edit.recognized:
+            if edit.request is None:
+                return VoiceRoute(
+                    VoiceRouteKind.REJECTED,
+                    reason_code=edit.reason_code or "invalid_edit_command",
+                    risk=CommandRisk.UNSUPPORTED,
+                )
+            return VoiceRoute(
+                VoiceRouteKind.SESSION_EDIT,
+                edit_request=edit.request,
+                risk=CommandRisk.DESTRUCTIVE,
+            )
         parsed = self.parser.parse(text, mode=mode, language=command_language)
         if parsed.disposition is ParseDisposition.EMPTY:
             return VoiceRoute(VoiceRouteKind.EMPTY, reason_code=parsed.reason_code)
         if parsed.disposition is ParseDisposition.DICTATION:
+            if VoiceMode(mode) is VoiceMode.MIXED:
+                end_action = extract_dictation_end_action(
+                    text, language=command_language
+                )
+                if end_action is not None:
+                    return VoiceRoute(
+                        VoiceRouteKind.DICTATION_THEN_CONTROL,
+                        dictation_text=end_action.text,
+                        request=ControlRequest(
+                            CanonicalIntent.SEND_KEY,
+                            key="enter",
+                            sensitivity=Sensitivity.SENSITIVE,
+                        ),
+                        risk=CommandRisk.SENSITIVE,
+                        action_code=end_action.action.value,
+                    )
             return VoiceRoute(VoiceRouteKind.DICTATION, dictation_text=text)
         if parsed.disposition is ParseDisposition.REJECTED or parsed.command is None:
             return VoiceRoute(

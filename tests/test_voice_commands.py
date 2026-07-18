@@ -155,6 +155,28 @@ def test_exact_commands_are_canonical(
     assert command.policy is ExecutionPolicy.IMMEDIATE
 
 
+@pytest.mark.parametrize(
+    ("text", "keys", "risk"),
+    (
+        ("выдели всё", ("ctrl", "a"), CommandRisk.SAFE),
+        ("select all", ("ctrl", "a"), CommandRisk.SAFE),
+        ("selecciona todo", ("ctrl", "a"), CommandRisk.SAFE),
+        ("copy selection", ("ctrl", "c"), CommandRisk.SAFE),
+        ("undo", ("ctrl", "z"), CommandRisk.DESTRUCTIVE),
+        ("rehacer", ("ctrl", "y"), CommandRisk.DESTRUCTIVE),
+    ),
+)
+def test_natural_editing_shortcuts_are_exact_and_never_named_clicks(
+    text: str, keys: tuple[str, ...], risk: CommandRisk
+) -> None:
+    command = _command(text)
+
+    assert command.intent is CommandIntent.PRESS_KEYS
+    assert command.keys == keys
+    assert command.risk is risk
+    assert command.target is None
+
+
 def test_confirmation_is_only_a_structured_intent_not_an_execution() -> None:
     result = parse_voice_input("command confirm", mode="mixed")
 
@@ -329,9 +351,30 @@ def test_allowlisted_keys_are_canonical_and_immediate(
 
 
 @pytest.mark.parametrize(
+    ("text", "keys"),
+    (
+        ("press Control Y", ("ctrl", "y")),
+        ("pulsa Control Y", ("ctrl", "y")),
+        ("press Control why", ("ctrl", "y")),
+        ("pulsa Control i griega", ("ctrl", "y")),
+        ("нажми клавиши контрол а", ("ctrl", "a")),
+    ),
+)
+def test_spoken_letter_aliases_keep_redo_and_select_all_reachable(
+    text: str, keys: tuple[str, ...]
+) -> None:
+    command = _command(text)
+
+    assert command.keys == keys
+
+
+@pytest.mark.parametrize(
     ("text", "risk"),
     [
         ("press Enter", CommandRisk.SENSITIVE),
+        ("нажми клавишу пробел", CommandRisk.SENSITIVE),
+        ("press Space", CommandRisk.SENSITIVE),
+        ("pulsa Espacio", CommandRisk.SENSITIVE),
         ("pulsa Control V", CommandRisk.SENSITIVE),
         ("нажми клавишу бэкспейс", CommandRisk.DESTRUCTIVE),
         ("press Alt F4", CommandRisk.DESTRUCTIVE),

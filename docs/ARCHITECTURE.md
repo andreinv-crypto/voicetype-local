@@ -14,6 +14,9 @@ Right Ctrl / configured switch
                    -> confirmation and deny-by-default policy
                    -> allowlisted Windows executor
        mixed     -> exact command prefix? commands : dictation
+                   -> exact final Enter/send phrase?
+                      insert verified text first
+                      -> confirmation -> typed Enter request
 ```
 
 ## Process boundaries
@@ -50,9 +53,12 @@ changed or stale elements fail closed.
 - audio/transcript: RAM only;
 - diagnostics: allowlisted, rotating, no content.
 
-The current raw, dictionary-normalized and final transcript stages remain only
-in process memory and are cleared on exit. Voice command source text is routed
-before these stages and is not retained. There is deliberately no transcript
+The current raw, dictionary-normalized and final transcript stages, plus the
+small UI feedback snapshot (`heard -> text -> command -> outcome`), remain only
+in process memory and are cleared on exit. Standalone voice-command source text
+is routed before these stages and is not retained. A compound everyday-mode
+dictation retains only the same session raw/final text already available to the
+user; it is never added to diagnostics. There is deliberately no transcript
 history store in the current architecture.
 
 Vector search is intentionally absent. Exact aliases and deterministic scope

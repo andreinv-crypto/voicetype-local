@@ -4,7 +4,7 @@ import io
 import queue
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +17,12 @@ from voicetype_local.focus import FocusMatch, FocusTarget
 from voicetype_local.memory import MemoryContext
 from voicetype_local.correction import CorrectionResult
 from voicetype_local.inserter import TextInsertionError
+from voicetype_local.session_editing import (
+    SessionEditAction,
+    SessionEditRequest,
+    plan_session_edit,
+)
+from voicetype_local.session_editor import SessionEditorResult, SessionEditorStatus
 from voicetype_local.voice_control import VoiceControlRouter
 from voicetype_local.windows_control import (
     CanonicalIntent,
@@ -174,11 +180,25 @@ def _bare_app() -> VoiceTypeApp:
     app.last_raw_text = ""
     app.last_local_text = ""
     app.last_text = ""
+    app._runtime_feedback = {
+        "heard": "",
+        "text": "",
+        "command": "",
+        "outcome": "Готово к работе",
+        "tone": "ready",
+    }
     app._insertion_uncertain = False
     app._last_insertion_target = None
     app._last_insertion_at = 0.0
     app._last_insertion_tail = ""
+    app._tracked_session_insertion = None
+    app._last_session_edit = None
     app.focus_inspector = _FocusInspector()
+    app.session_editor = SimpleNamespace(
+        apply=lambda *_args, **_kwargs: SessionEditorResult(
+            SessionEditorStatus.UNAVAILABLE, "not_configured"
+        )
+    )
     app.voice_router = VoiceControlRouter()
     app.control_executor = _ControlExecutor()
     app.memory_store = _MemoryStore()
@@ -186,6 +206,7 @@ def _bare_app() -> VoiceTypeApp:
     app.cloud_transcriber = None
     app._target_focus = None
     app._pending_control_request = None
+    app._pending_dictation_action = None
     app._pending_control_deadline = 0.0
     app._pending_control_token = 0
     app._number_snapshot = None
@@ -204,6 +225,10 @@ def _bare_app() -> VoiceTypeApp:
     app._actions = queue.Queue()
     app._record_timer = None
     app._closing = False
+    app._settings_window = None
+    app._microphone_options_cache = ()
+    app._microphone_scan_lock = threading.Lock()
+    app._microphone_scan_in_progress = False
     app._audio_backend_blocked = False
     app._blocked_audio_recorder = None
     app._recorder_factory = lambda: app.recorder
@@ -267,6 +292,40 @@ def test_microphone_stop_never_blocks_the_ui() -> None:
     release.set()
     app._actions.get(timeout=1)()
     assert app.state == AppState.IDLE
+
+
+def test_microphone_device_scan_is_backgrounded_and_single_flight(monkeypatch) -> None:
+    app = _bare_app()
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def slow_devices() -> list[str]:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        release.wait(2)
+        return ["Test microphone"]
+
+    monkeypatch.setattr(app_module.AudioRecorder, "input_devices", slow_devices)
+
+    before = time.perf_counter()
+    app._start_microphone_scan()
+    app._start_microphone_scan()
+    elapsed = time.perf_counter() - before
+
+    assert elapsed < 0.2
+    assert entered.wait(1)
+    assert calls == 1
+    release.set()
+    app._actions.get(timeout=1)()
+    assert app._microphone_options_cache == ("Test microphone",)
+
+    entered.clear()
+    app._start_microphone_scan()
+    assert entered.wait(1)
+    app._actions.get(timeout=1)()
+    assert calls == 2
 
 
 def test_hold_release_stops_recording_and_cancels_unfinished_start() -> None:
@@ -821,6 +880,68 @@ def test_clear_session_text_removes_all_ram_stages() -> None:
     assert app.state == AppState.IDLE
 
 
+def test_clear_session_text_invalidates_in_flight_session_edit_worker() -> None:
+    app = _bare_app()
+    app.state = AppState.PROCESSING
+    app._processing_stage = "session_edit"
+    app._generation = 30
+    app.last_raw_text = "исходный текст"
+    app.last_local_text = "Первое. Второе."
+    app.last_text = "Первое. Второе."
+    tracked = app_module._TrackedSessionInsertion(
+        app.last_text,
+        app.focus_inspector.target,
+        time.monotonic(),
+    )
+    app._tracked_session_insertion = tracked
+    request = SessionEditRequest(
+        SessionEditAction.DELETE_LAST_SENTENCE,
+        language="ru",  # type: ignore[arg-type]
+    )
+    plan = plan_session_edit(tracked.text, request)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def apply(_plan, _target, *, is_current):
+        assert is_current()
+        entered.set()
+        assert release.wait(2)
+        return SessionEditorResult(
+            SessionEditorStatus.EXECUTED,
+            "ok",
+            backend="delayed-fake",
+        )
+
+    app.session_editor = SimpleNamespace(apply=apply)
+    worker = threading.Thread(
+        target=app._session_edit_worker,
+        args=(request, plan, tracked, 30),
+    )
+    worker.start()
+    assert entered.wait(1)
+
+    app.clear_session_text()
+    feedback_after_clear = dict(app._runtime_feedback)
+    release.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert app._generation == 31
+    assert app.state == AppState.IDLE
+    assert app.last_raw_text == ""
+    assert app.last_local_text == ""
+    assert app.last_text == ""
+    assert app._tracked_session_insertion is None
+    assert app._last_session_edit is None
+    assert app._insertion_uncertain is True
+    assert app._actions.empty()
+    assert app._runtime_feedback == feedback_after_clear
+    assert app._runtime_feedback["heard"] == ""
+    assert app._runtime_feedback["text"] == ""
+    assert app._runtime_feedback["command"] == ""
+    assert "не подтверждён" in app._runtime_feedback["outcome"]
+
+
 def test_commands_mode_executes_typed_request_without_retaining_spoken_text() -> None:
     app = _bare_app()
     app.settings_store.settings.interaction_mode = "commands"
@@ -861,6 +982,519 @@ def test_mixed_mode_without_prefix_stays_on_dictation_path() -> None:
         request.intent is CanonicalIntent.OPEN_APP
         for request, _confirmed in app.control_executor.calls
     )
+
+
+def test_successful_dictation_becomes_the_only_session_edit_target() -> None:
+    app = _bare_app()
+    app.state = AppState.PROCESSING
+    app._generation = 31
+    app._target_focus = app.focus_inspector.target
+    app.inserter = SimpleNamespace(insert=lambda _text: None)
+
+    app._final_text_ready("Первое. Второе.", "ru", 0.9, 31)
+
+    assert app._tracked_session_insertion is not None
+    assert app._tracked_session_insertion.text == "Первое. Второе."
+    assert app._tracked_session_insertion.target == app.focus_inspector.target
+
+
+def test_voice_session_edit_updates_only_the_verified_last_insertion() -> None:
+    app = _bare_app()
+    app.settings_store.settings.interaction_mode = "mixed"
+    app.settings_store.settings.language = "ru"
+    app.state = AppState.PROCESSING
+    app._generation = 71
+    app._target_focus = app.focus_inspector.target
+    app.last_text = "Первое. Второе."
+    app.last_local_text = app.last_text
+    app._tracked_session_insertion = app_module._TrackedSessionInsertion(
+        app.last_text,
+        app.focus_inspector.target,
+        time.monotonic(),
+    )
+    plans = []
+
+    def apply(plan, _target, **_kwargs):
+        plans.append(plan)
+        return SessionEditorResult(
+            SessionEditorStatus.EXECUTED,
+            "ok",
+            backend="fake",
+        )
+
+    app.session_editor = SimpleNamespace(apply=apply)
+
+    app._transcription_ready(
+        "команда удали последнее предложение", "ru", 0.9, 71
+    )
+    app._actions.get(timeout=1)()
+
+    assert len(plans) == 1
+    assert plans[0].selected_text == " Второе."
+    assert app.last_text == "Первое."
+    assert app._tracked_session_insertion is not None
+    assert app._tracked_session_insertion.text == "Первое."
+    assert app._last_session_edit is not None
+    assert app.state == AppState.IDLE
+
+
+def test_session_edit_keeps_service_spacing_out_of_last_text_and_syncs_tail() -> None:
+    app = _bare_app()
+    app.settings_store.settings.automatic_spacing = True
+    app.state = AppState.PROCESSING
+    app._processing_stage = "session_edit"
+    app._generation = 73
+    tracked = app_module._TrackedSessionInsertion(
+        " Первое. Второе.",
+        app.focus_inspector.target,
+        time.monotonic(),
+        " ",
+    )
+    request = SessionEditRequest(
+        SessionEditAction.DELETE_LAST_SENTENCE,
+        language="ru",  # type: ignore[arg-type]
+    )
+    plan = plan_session_edit(tracked.text, request)
+
+    app._session_edit_ready(
+        request,
+        plan,
+        tracked,
+        SessionEditorResult(SessionEditorStatus.EXECUTED, "ok", backend="fake"),
+        73,
+        10,
+    )
+
+    assert app.last_text == "Первое."
+    assert app.last_local_text == "Первое."
+    assert app._tracked_session_insertion is not None
+    assert app._tracked_session_insertion.text == " Первое."
+    assert app._last_insertion_tail == "."
+
+    app.state = AppState.PROCESSING
+    delete_all = SessionEditRequest(
+        SessionEditAction.DELETE_LAST_DICTATION,
+        language="ru",  # type: ignore[arg-type]
+    )
+    current = app._tracked_session_insertion
+    delete_plan = plan_session_edit(current.text, delete_all)
+    app._session_edit_ready(
+        delete_all,
+        delete_plan,
+        current,
+        SessionEditorResult(SessionEditorStatus.EXECUTED, "ok", backend="fake"),
+        73,
+        10,
+    )
+
+    assert app.last_text == ""
+    assert app._last_insertion_tail == ""
+    assert app._last_insertion_target is None
+
+
+def test_restore_after_full_delete_uses_bound_empty_field_transaction() -> None:
+    app = _bare_app()
+    app.state = AppState.PROCESSING
+    app._processing_stage = "session_edit"
+    app._generation = 74
+    app.focus_inspector.target = replace(
+        app.focus_inspector.target,
+        uia_runtime_id=(101, 102, 103),
+    )
+    original = "Полностью удалённая диктовка."
+    tracked = app_module._TrackedSessionInsertion(
+        original,
+        app.focus_inspector.target,
+        time.monotonic(),
+    )
+    delete_request = SessionEditRequest(
+        SessionEditAction.DELETE_LAST_DICTATION,
+        language="ru",  # type: ignore[arg-type]
+    )
+    delete_plan = plan_session_edit(original, delete_request)
+    app._session_edit_ready(
+        delete_request,
+        delete_plan,
+        tracked,
+        SessionEditorResult(
+            SessionEditorStatus.EXECUTED,
+            "ok",
+            backend="fake",
+            empty_document_verified=True,
+        ),
+        74,
+        10,
+    )
+    assert app._tracked_session_insertion is not None
+    assert app._tracked_session_insertion.text == ""
+    assert app._last_session_edit is not None
+
+    captured: list[SessionEditPlan] = []
+
+    def apply(plan, _target, **_kwargs):
+        captured.append(plan)
+        return SessionEditorResult(SessionEditorStatus.EXECUTED, "ok", backend="fake")
+
+    app.session_editor = SimpleNamespace(apply=apply)
+    app.state = AppState.PROCESSING
+    restore_request = SessionEditRequest(
+        SessionEditAction.RESTORE_LAST_EDIT,
+        language="ru",  # type: ignore[arg-type]
+    )
+    app._start_session_edit(
+        restore_request,
+        app.focus_inspector.target,
+        74,
+    )
+    app._actions.get(timeout=1)()
+
+    assert len(captured) == 1
+    assert captured[0].original_text == ""
+    assert captured[0].selected_text == ""
+    assert captured[0].result_text == original
+    assert app.last_text == original
+    assert app._tracked_session_insertion is not None
+    assert app._tracked_session_insertion.text == original
+    assert app._last_session_edit is None
+
+    app.state = AppState.PROCESSING
+    app._start_session_edit(restore_request, app.focus_inspector.target, 74)
+
+    assert app.state == AppState.IDLE
+    assert len(captured) == 1
+
+
+def test_restore_after_full_delete_requires_verified_empty_field_capability() -> None:
+    app = _bare_app()
+    app.state = AppState.PROCESSING
+    app._generation = 75
+    app._tracked_session_insertion = app_module._TrackedSessionInsertion(
+        "",
+        app.focus_inspector.target,
+        time.monotonic(),
+    )
+    app._last_session_edit = app_module._SessionEditTransaction(
+        "Не восстанавливать вслепую",
+        "",
+        app.focus_inspector.target,
+        time.monotonic(),
+        allow_empty_restore=False,
+    )
+    app.session_editor = SimpleNamespace(
+        apply=lambda *_args, **_kwargs: pytest.fail("backend must not run")
+    )
+    request = SessionEditRequest(
+        SessionEditAction.RESTORE_LAST_EDIT,
+        language="ru",  # type: ignore[arg-type]
+    )
+
+    app._start_session_edit(request, app.focus_inspector.target, 75)
+
+    assert app.state == AppState.IDLE
+    assert app._tracked_session_insertion.text == ""
+    assert app._last_session_edit is not None
+
+
+def test_restore_after_full_delete_requires_exact_uia_field_identity() -> None:
+    app = _bare_app()
+    app.state = AppState.PROCESSING
+    app._generation = 76
+    app._tracked_session_insertion = app_module._TrackedSessionInsertion(
+        "",
+        app.focus_inspector.target,
+        time.monotonic(),
+    )
+    app._last_session_edit = app_module._SessionEditTransaction(
+        "Не восстанавливать без точного поля",
+        "",
+        app.focus_inspector.target,
+        time.monotonic(),
+        allow_empty_restore=True,
+    )
+    app.session_editor = SimpleNamespace(
+        apply=lambda *_args, **_kwargs: pytest.fail("backend must not run")
+    )
+    request = SessionEditRequest(
+        SessionEditAction.RESTORE_LAST_EDIT,
+        language="ru",  # type: ignore[arg-type]
+    )
+
+    app._start_session_edit(request, app.focus_inspector.target, 76)
+
+    assert app.state == AppState.IDLE
+    assert app._tracked_session_insertion.text == ""
+    assert app._last_session_edit is not None
+
+
+def test_accepted_empty_restore_attempt_consumes_capability_on_rejection() -> None:
+    app = _bare_app()
+    app.state = AppState.PROCESSING
+    app._generation = 77
+    app.focus_inspector.target = replace(
+        app.focus_inspector.target,
+        uia_runtime_id=(201, 202, 203),
+    )
+    target = app.focus_inspector.target
+    app._tracked_session_insertion = app_module._TrackedSessionInsertion(
+        "",
+        target,
+        time.monotonic(),
+    )
+    app._last_session_edit = app_module._SessionEditTransaction(
+        "Старый текст",
+        "",
+        target,
+        time.monotonic(),
+        allow_empty_restore=True,
+    )
+    app.session_editor = SimpleNamespace(
+        apply=lambda *_args, **_kwargs: SessionEditorResult(
+            SessionEditorStatus.REJECTED,
+            "caret_or_text_changed",
+            backend="fake",
+        )
+    )
+    request = SessionEditRequest(
+        SessionEditAction.RESTORE_LAST_EDIT,
+        language="ru",  # type: ignore[arg-type]
+    )
+
+    app._start_session_edit(request, target, 77)
+    app._actions.get(timeout=1)()
+
+    assert app.state == AppState.IDLE
+    assert app._tracked_session_insertion.text == ""
+    assert app._last_session_edit is None
+
+
+def test_session_editor_exception_invalidates_all_edit_tracking() -> None:
+    app = _bare_app()
+    app.state = AppState.PROCESSING
+    app._generation = 78
+    tracked = app_module._TrackedSessionInsertion(
+        "Текст для изменения.",
+        app.focus_inspector.target,
+        time.monotonic(),
+    )
+    app._tracked_session_insertion = tracked
+    app._last_session_edit = app_module._SessionEditTransaction(
+        "Предыдущий текст.",
+        tracked.text,
+        tracked.target,
+        time.monotonic(),
+    )
+
+    def fail_after_unknown_phase(*_args, **_kwargs):
+        raise RuntimeError("unknown backend phase")
+
+    app.session_editor = SimpleNamespace(apply=fail_after_unknown_phase)
+    request = SessionEditRequest(
+        SessionEditAction.DELETE_LAST_WORD,
+        language="ru",  # type: ignore[arg-type]
+    )
+
+    app._start_session_edit(request, app.focus_inspector.target, 78)
+    app._actions.get(timeout=1)()
+
+    assert app.state == AppState.IDLE
+    assert app._tracked_session_insertion is None
+    assert app._last_session_edit is None
+    assert app._insertion_uncertain is True
+
+
+def test_cancel_during_session_edit_invalidates_tracking_and_spacing() -> None:
+    app = _bare_app()
+    app.state = AppState.PROCESSING
+    app._processing_stage = "session_edit"
+    app._generation = 74
+    app._tracked_session_insertion = app_module._TrackedSessionInsertion(
+        " text",
+        app.focus_inspector.target,
+        time.monotonic(),
+        " ",
+    )
+    app._last_session_edit = app_module._SessionEditTransaction(
+        " old",
+        " text",
+        app.focus_inspector.target,
+        time.monotonic(),
+    )
+    app._last_insertion_target = app.focus_inspector.target
+    app._last_insertion_at = time.monotonic()
+    app._last_insertion_tail = "t"
+
+    app.cancel()
+
+    assert app.state == AppState.IDLE
+    assert app._generation == 75
+    assert app._tracked_session_insertion is None
+    assert app._last_session_edit is None
+    assert app._insertion_uncertain is True
+    assert app._last_insertion_target is None
+    assert app._last_insertion_tail == ""
+
+
+def test_session_edit_watchdog_invalidates_late_worker() -> None:
+    app = _bare_app()
+    app.state = AppState.PROCESSING
+    app._processing_stage = "session_edit"
+    app._generation = 75
+    app._tracked_session_insertion = app_module._TrackedSessionInsertion(
+        "text",
+        app.focus_inspector.target,
+        time.monotonic(),
+    )
+    app._last_insertion_target = app.focus_inspector.target
+    app._last_insertion_tail = "t"
+    request = SessionEditRequest(
+        SessionEditAction.DELETE_LAST_WORD,
+        language="en",  # type: ignore[arg-type]
+    )
+
+    app._session_edit_timeout(request, 75)
+
+    assert app.state == AppState.IDLE
+    assert app._generation == 76
+    assert app._tracked_session_insertion is None
+    assert app._insertion_uncertain is True
+    assert app._last_insertion_tail == ""
+
+
+def test_session_edit_refuses_focus_change_before_backend_side_effect() -> None:
+    app = _bare_app()
+    app.settings_store.settings.interaction_mode = "mixed"
+    app.settings_store.settings.language = "ru"
+    app.state = AppState.PROCESSING
+    app._generation = 72
+    changed = FocusTarget(
+        foreground_hwnd=99,
+        root_hwnd=99,
+        focused_hwnd=100,
+        thread_id=101,
+        process_id=102,
+        focused_class_name="Edit",
+        stable=True,
+    )
+    app._target_focus = changed
+    app._tracked_session_insertion = app_module._TrackedSessionInsertion(
+        "Не трогать.",
+        app.focus_inspector.target,
+        time.monotonic(),
+    )
+    app.session_editor = SimpleNamespace(
+        apply=lambda *_args, **_kwargs: pytest.fail("backend must not run")
+    )
+
+    app._transcription_ready(
+        "команда удали последнее предложение", "ru", 0.9, 72
+    )
+
+    assert app.state == AppState.IDLE
+    assert app._tracked_session_insertion.text == "Не трогать."
+    assert "не тронут" in app.overlay.messages[-1][0].casefold()
+
+
+def test_everyday_mode_inserts_text_then_requires_confirmation_for_end_action() -> None:
+    app = _bare_app()
+    app.settings_store.settings.interaction_mode = "mixed"
+    app.settings_store.settings.language = "auto"
+
+    class _ConfirmingExecutor(_ControlExecutor):
+        def execute(
+            self, request: ControlRequest, *, confirmed: bool = False
+        ) -> ControlResult:
+            self.calls.append((request, confirmed))
+            if not confirmed:
+                return ControlResult(
+                    ResultStatus.CONFIRMATION_REQUIRED,
+                    request.intent,
+                    reason_code="key_requires_confirmation",
+                    confirmation_required=True,
+                )
+            return ControlResult(ResultStatus.EXECUTED, request.intent, backend="fake")
+
+    executor = _ConfirmingExecutor()
+    app.control_executor = executor
+    inserted: list[str] = []
+    app.inserter = SimpleNamespace(insert=inserted.append)
+    app.correction_pipeline = SimpleNamespace(
+        correct=lambda text, _context: CorrectionResult(text, False, "local")
+    )
+    app.normalizer = SimpleNamespace(
+        normalize=lambda text, _rules, protected_terms=(): SimpleNamespace(
+            text=text, applied=()
+        )
+    )
+    app.memory_store = SimpleNamespace(
+        replacement_candidates=lambda _context, draft: (),
+        mark_terms_used=lambda _ids: None,
+    )
+    app.prompt_builder = SimpleNamespace(
+        build_post_asr=lambda _store, _text, _context: SimpleNamespace(
+            terms=(), styles=()
+        )
+    )
+    app.state = AppState.PROCESSING
+    app._generation = 40
+    app._target_focus = app.focus_inspector.target
+
+    # Detected language is deliberately wrong; Auto must still try all three
+    # strict grammars for the short final command.
+    app._transcription_ready("Напиши другу, нажать Enter", "en", 0.9, 40)
+    app._actions.get(timeout=1)()
+    app._actions.get(timeout=1)()
+
+    assert inserted == ["Напиши другу"]
+    assert app.last_raw_text == "Напиши другу, нажать Enter"
+    assert app.last_text == "Напиши другу"
+    assert [confirmed for _request, confirmed in executor.calls] == [False]
+    assert app._pending_control_request is not None
+    assert app._runtime_feedback["command"] == "Нажать Enter"
+
+    app.state = AppState.PROCESSING
+    app._generation = 41
+    app._transcription_ready("подтверждаю", "en", 0.9, 41)
+    app._actions.get(timeout=1)()
+
+    assert [confirmed for _request, confirmed in executor.calls] == [False, True]
+    assert app._pending_control_request is None
+    assert app.state == AppState.IDLE
+
+
+def test_end_action_is_blocked_when_focus_changes_before_insertion() -> None:
+    app = _bare_app()
+    app.settings_store.settings.interaction_mode = "mixed"
+    app.settings_store.settings.language = "ru"
+    app.focus_inspector.match = FocusMatch.CHANGED
+    app.inserter = SimpleNamespace(insert=lambda _text: pytest.fail("must not insert"))
+    app.correction_pipeline = SimpleNamespace(
+        correct=lambda text, _context: CorrectionResult(text, False, "local")
+    )
+    app.normalizer = SimpleNamespace(
+        normalize=lambda text, _rules, protected_terms=(): SimpleNamespace(
+            text=text, applied=()
+        )
+    )
+    app.memory_store = SimpleNamespace(
+        replacement_candidates=lambda _context, draft: (),
+        mark_terms_used=lambda _ids: None,
+    )
+    app.prompt_builder = SimpleNamespace(
+        build_post_asr=lambda _store, _text, _context: SimpleNamespace(
+            terms=(), styles=()
+        )
+    )
+    app.state = AppState.PROCESSING
+    app._generation = 42
+    app._target_focus = app.focus_inspector.target
+
+    app._transcription_ready("Текст, отправить сообщение", "ru", 0.9, 42)
+    app._actions.get(timeout=1)()
+
+    assert app._pending_dictation_action is None
+    assert app.control_executor.calls == []
+    assert app.state == AppState.PENDING_INSERT
+    assert "не выполнена" in app._runtime_feedback["outcome"].casefold()
 
 
 def test_sensitive_command_confirmation_is_bound_and_one_shot() -> None:

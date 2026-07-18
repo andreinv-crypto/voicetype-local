@@ -206,7 +206,7 @@ def test_client_times_out_kills_and_retries_once(tmp_path) -> None:
     assert not client.is_alive
 
 
-def test_request_transfer_is_bounded_and_retried_once(tmp_path) -> None:
+def test_request_transfer_uses_one_total_budget_across_recovery(tmp_path) -> None:
     first = _BlockingContext()
     second = _BlockingContext()
     contexts = iter([first, second])
@@ -218,9 +218,10 @@ def test_request_transfer_is_bounded_and_retried_once(tmp_path) -> None:
         context_factory=lambda: next(contexts),
     )
 
-    with pytest.raises(WorkerTimeoutError, match="request transfer timed out"):
+    with pytest.raises(WorkerTimeoutError, match="timed out"):
         client.transcribe(b"wav", "ru", timeout=0.1)
 
     assert first.process.terminated
-    assert second.process.terminated
+    assert second.parent.sent == []
+    assert not second.process.alive
     client.close()

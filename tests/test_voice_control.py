@@ -4,6 +4,7 @@ from dataclasses import asdict
 
 import pytest
 
+from voicetype_local.session_editing import SessionEditAction
 from voicetype_local.voice_commands import CommandRisk
 from voicetype_local.voice_control import (
     VoiceControlRouter,
@@ -35,6 +36,147 @@ def test_mixed_mode_requires_prefix_and_drops_command_transcript() -> None:
     assert command.request.intent is CanonicalIntent.OPEN_APP
     assert command.request.app_id == "chrome"
     assert "команда" not in repr(asdict(command))
+
+
+@pytest.mark.parametrize(
+    ("text", "language", "body", "action_code"),
+    (
+        ("Напиши другу, нажать Enter", "ru", "Напиши другу", "press_enter"),
+        ("See you soon, send message", "en", "See you soon", "send_message"),
+        ("Nos vemos mañana, enviar mensaje", "es", "Nos vemos mañana", "send_message"),
+        ("Текст press Enter", "auto", "Текст", "press_enter"),
+    ),
+)
+def test_mixed_mode_supports_exact_action_only_at_dictation_end(
+    text: str, language: str, body: str, action_code: str
+) -> None:
+    route = VoiceControlRouter().route(text, mode="mixed", language=language)
+
+    assert route.kind is VoiceRouteKind.DICTATION_THEN_CONTROL
+    assert route.dictation_text == body
+    assert route.action_code == action_code
+    assert route.request is not None
+    assert route.request.intent is CanonicalIntent.SEND_KEY
+    assert route.request.key == "enter"
+    assert route.request.sensitivity is Sensitivity.SENSITIVE
+
+
+def test_end_action_words_stay_text_in_dictation_mode_or_in_the_middle() -> None:
+    router = VoiceControlRouter()
+
+    dictation = router.route(
+        "Напиши другу, нажать Enter", mode="dictation", language="ru"
+    )
+    middle = router.route(
+        "Нажать Enter, а потом продолжить текст", mode="mixed", language="ru"
+    )
+
+    assert dictation.kind is VoiceRouteKind.DICTATION
+    assert dictation.dictation_text == "Напиши другу, нажать Enter"
+    assert middle.kind is VoiceRouteKind.DICTATION
+    assert middle.dictation_text == "Нажать Enter, а потом продолжить текст"
+
+
+def test_session_edit_requires_prefix_in_mixed_mode_and_is_typed() -> None:
+    router = VoiceControlRouter()
+
+    ordinary = router.route(
+        "удали последнее предложение", mode="mixed", language="ru"
+    )
+    edit = router.route(
+        "команда удали последнее предложение", mode="mixed", language="ru"
+    )
+
+    assert ordinary.kind is VoiceRouteKind.DICTATION
+    assert edit.kind is VoiceRouteKind.SESSION_EDIT
+    assert edit.edit_request is not None
+    assert edit.edit_request.action is SessionEditAction.DELETE_LAST_SENTENCE
+    assert edit.request is None
+    assert edit.dictation_text is None
+
+
+def test_whisper_sentence_break_after_prefix_routes_to_session_edit() -> None:
+    route = VoiceControlRouter().route(
+        "Команда. Удали последнее предложение.",
+        mode="mixed",
+        language="auto",
+    )
+
+    assert route.kind is VoiceRouteKind.SESSION_EDIT
+    assert route.edit_request is not None
+    assert route.edit_request.action is SessionEditAction.DELETE_LAST_SENTENCE
+
+
+def test_polite_russian_edit_alias_routes_to_session_edit_without_transcript() -> None:
+    route = VoiceControlRouter().route(
+        "Команда, пожалуйста, убрать последнюю фразу.",
+        mode="mixed",
+        language="auto",
+    )
+
+    assert route.kind is VoiceRouteKind.SESSION_EDIT
+    assert route.edit_request is not None
+    assert route.edit_request.action is SessionEditAction.DELETE_LAST_SENTENCE
+    assert route.dictation_text is None
+    assert route.request is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "убрать последний текст",
+        "пожалуйста поменяй последнее слово на готово",
+    ),
+)
+def test_new_russian_edit_alias_stays_dictation_without_mixed_mode_prefix(
+    text: str,
+) -> None:
+    route = VoiceControlRouter().route(text, mode="mixed", language="ru")
+
+    assert route.kind is VoiceRouteKind.DICTATION
+    assert route.dictation_text == text
+    assert route.edit_request is None
+
+
+def test_delete_everything_phrase_is_rejected_without_an_edit_request() -> None:
+    route = VoiceControlRouter().route(
+        "команда пожалуйста удали всё",
+        mode="mixed",
+        language="ru",
+    )
+
+    assert route.kind is VoiceRouteKind.REJECTED
+    assert route.reason_code == "invalid_edit_command"
+    assert route.edit_request is None
+
+
+def test_malformed_session_edit_is_rejected_before_named_click_parser() -> None:
+    route = VoiceControlRouter().route(
+        "delete something somewhere", mode="commands", language="en"
+    )
+
+    assert route.kind is VoiceRouteKind.REJECTED
+    assert route.reason_code == "invalid_edit_command"
+    assert route.request is None
+
+
+@pytest.mark.parametrize(
+    ("text", "language"),
+    (
+        ("отправить сообщение", "ru"),
+        ("send message", "en"),
+        ("enviar mensaje", "es"),
+    ),
+)
+def test_send_message_is_a_sensitive_standalone_control_command(
+    text: str, language: str
+) -> None:
+    route = VoiceControlRouter().route(text, mode="commands", language=language)
+
+    assert route.kind is VoiceRouteKind.CONTROL
+    assert route.request is not None
+    assert route.request.key == "enter"
+    assert route.request.sensitivity is Sensitivity.SENSITIVE
 
 
 @pytest.mark.parametrize(
@@ -155,3 +297,8 @@ def test_route_invariants_reject_accidental_private_or_mixed_payloads() -> None:
         VoiceRoute(VoiceRouteKind.HELP, dictation_text="private speech")
     with pytest.raises(ValueError):
         VoiceRoute(VoiceRouteKind.CONTROL)
+    with pytest.raises(ValueError):
+        VoiceRoute(
+            VoiceRouteKind.DICTATION_THEN_CONTROL,
+            dictation_text="text",
+        )

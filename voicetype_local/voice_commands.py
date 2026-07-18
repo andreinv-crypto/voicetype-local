@@ -263,6 +263,38 @@ _EXACT_INTENTS: Final[
     },
 }
 
+_EXACT_KEY_COMMANDS: Final[
+    dict[CommandLanguage, dict[str, tuple[tuple[str, ...], CommandRisk]]]
+] = {
+    CommandLanguage.RU: {
+        "выдели все": (("ctrl", "a"), CommandRisk.SAFE),
+        "выделить все": (("ctrl", "a"), CommandRisk.SAFE),
+        "скопируй выделенное": (("ctrl", "c"), CommandRisk.SAFE),
+        "копировать выделенное": (("ctrl", "c"), CommandRisk.SAFE),
+        "отмени последнее действие": (("ctrl", "z"), CommandRisk.DESTRUCTIVE),
+        "повтори отмененное действие": (("ctrl", "y"), CommandRisk.DESTRUCTIVE),
+    },
+    CommandLanguage.EN: {
+        "select all": (("ctrl", "a"), CommandRisk.SAFE),
+        "copy selection": (("ctrl", "c"), CommandRisk.SAFE),
+        "copy selected text": (("ctrl", "c"), CommandRisk.SAFE),
+        "undo": (("ctrl", "z"), CommandRisk.DESTRUCTIVE),
+        "undo last action": (("ctrl", "z"), CommandRisk.DESTRUCTIVE),
+        "redo": (("ctrl", "y"), CommandRisk.DESTRUCTIVE),
+        "redo last action": (("ctrl", "y"), CommandRisk.DESTRUCTIVE),
+    },
+    CommandLanguage.ES: {
+        "selecciona todo": (("ctrl", "a"), CommandRisk.SAFE),
+        "seleccionar todo": (("ctrl", "a"), CommandRisk.SAFE),
+        "copia la seleccion": (("ctrl", "c"), CommandRisk.SAFE),
+        "copiar la seleccion": (("ctrl", "c"), CommandRisk.SAFE),
+        "deshacer": (("ctrl", "z"), CommandRisk.DESTRUCTIVE),
+        "deshaz la ultima accion": (("ctrl", "z"), CommandRisk.DESTRUCTIVE),
+        "rehacer": (("ctrl", "y"), CommandRisk.DESTRUCTIVE),
+        "rehaz la ultima accion": (("ctrl", "y"), CommandRisk.DESTRUCTIVE),
+    },
+}
+
 _FORBIDDEN_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
     re.compile(pattern)
     for pattern in (
@@ -437,8 +469,11 @@ _BASE_KEY_ALIASES: Final[dict[CommandLanguage, dict[str, str]]] = {
         "стрелка вправо": "right",
         "си": "c",
         "с": "c",
+        "а": "a",
+        "эй": "a",
         "ви": "v",
         "вэ": "v",
+        "икс": "x",
         "зет": "z",
         "игрек": "y",
     },
@@ -452,6 +487,9 @@ _BASE_KEY_ALIASES: Final[dict[CommandLanguage, dict[str, str]]] = {
         "arrow left": "left",
         "right arrow": "right",
         "arrow right": "right",
+        "why": "y",
+        "zee": "z",
+        "zed": "z",
     },
     CommandLanguage.ES: {
         **_COMMON_BASE_KEYS,
@@ -469,13 +507,15 @@ _BASE_KEY_ALIASES: Final[dict[CommandLanguage, dict[str, str]]] = {
         "flecha abajo": "down",
         "flecha izquierda": "left",
         "flecha derecha": "right",
+        "ye": "y",
+        "i griega": "y",
+        "zeta": "z",
     },
 }
 
 _IMMEDIATE_KEY_COMBOS: Final[set[tuple[str, ...]]] = {
     ("escape",),
     ("tab",),
-    ("space",),
     ("home",),
     ("end",),
     ("page_up",),
@@ -503,6 +543,7 @@ _IMMEDIATE_KEY_COMBOS: Final[set[tuple[str, ...]]] = {
 
 _SENSITIVE_KEY_COMBOS: Final[set[tuple[str, ...]]] = {
     ("enter",),
+    ("space",),
     ("ctrl", "p"),
     ("ctrl", "s"),
     ("ctrl", "v"),
@@ -625,7 +666,10 @@ def _clean_target(target: str, language: CommandLanguage) -> str:
 def _canonicalize_keys(
     phrase: str, language: CommandLanguage
 ) -> tuple[str, ...] | None:
-    value = re.sub(r"\b(?:plus|and|и|mas|y)\b", " ", phrase)
+    # Spanish ``y`` is both the conjunction "and" and the literal Y key.
+    # Removing it globally made Ctrl+Y impossible, so only unambiguous spoken
+    # connectors are discarded here.
+    value = re.sub(r"\b(?:plus|and|и|плюс|mas)\b", " ", phrase)
     value = re.sub(r"\s+", " ", value).strip()
     aliases = _MODIFIER_ALIASES[language]
     modifiers: list[str] = []
@@ -654,6 +698,26 @@ def _canonicalize_keys(
 def _parse_key_command(
     text: str, language: CommandLanguage
 ) -> tuple[VoiceCommand | None, str | None]:
+    send_message_phrases = {
+        CommandLanguage.RU: {"отправить сообщение", "отправь сообщение"},
+        CommandLanguage.EN: {"send message", "send the message"},
+        CommandLanguage.ES: {
+            "enviar mensaje",
+            "enviar el mensaje",
+            "envia mensaje",
+            "envia el mensaje",
+        },
+    }
+    if text in send_message_phrases[language]:
+        return (
+            _make_command(
+                CommandIntent.PRESS_KEYS,
+                language,
+                keys=("enter",),
+                risk=CommandRisk.SENSITIVE,
+            ),
+            None,
+        )
     patterns = {
         CommandLanguage.RU: re.compile(
             r"^(?:нажми|нажать)(?: (?P<marker>клавишу|клавиши|сочетание(?: клавиш)?))? (?P<keys>.+)$"
@@ -711,6 +775,15 @@ def _parse_key_command(
 
 
 def _parse_exact(text: str, language: CommandLanguage) -> VoiceCommand | None:
+    key_command = _EXACT_KEY_COMMANDS[language].get(text)
+    if key_command is not None:
+        keys, risk = key_command
+        return _make_command(
+            CommandIntent.PRESS_KEYS,
+            language,
+            keys=keys,
+            risk=risk,
+        )
     intent = _EXACT_INTENTS[language].get(text)
     return _make_command(intent, language) if intent is not None else None
 

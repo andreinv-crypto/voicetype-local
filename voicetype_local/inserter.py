@@ -3,12 +3,14 @@ from __future__ import annotations
 import ctypes
 import time
 import unicodedata
+from collections.abc import Callable
 from ctypes import wintypes
 
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
+VK_BACK = 0x08
 
 ULONG_PTR = wintypes.WPARAM
 
@@ -16,9 +18,16 @@ ULONG_PTR = wintypes.WPARAM
 class TextInsertionError(RuntimeError):
     """SendInput failure with an explicit partial-insertion safety signal."""
 
-    def __init__(self, message: str, *, partial: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial: bool,
+        reason_code: str = "sendinput_failed",
+    ) -> None:
         super().__init__(message)
         self.partial = partial
+        self.reason_code = reason_code
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -78,11 +87,34 @@ class UnicodeTextInserter:
         self._send_input.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
         self._send_input.restype = wintypes.UINT
 
-    def _send(self, events: list[INPUT]) -> None:
+    @staticmethod
+    def _check_batch_guard(before_batch: Callable[[], bool] | None) -> None:
+        if before_batch is None:
+            return
+        try:
+            allowed = bool(before_batch())
+        except Exception:
+            allowed = False
+        if not allowed:
+            raise TextInsertionError(
+                "Input target changed before SendInput",
+                partial=False,
+                reason_code="input_guard_rejected",
+            )
+
+    def _send(
+        self,
+        events: list[INPUT],
+        *,
+        before_batch: Callable[[], bool] | None = None,
+    ) -> None:
         if not events:
             return
         array_type = INPUT * len(events)
         array = array_type(*events)
+        # This is deliberately adjacent to the native call: every SendInput
+        # batch gets a fresh target/focus proof from the session editor.
+        self._check_batch_guard(before_batch)
         sent = self._send_input(len(events), array, ctypes.sizeof(INPUT))
         if sent != len(events):
             error = ctypes.WinError(ctypes.get_last_error())
@@ -91,7 +123,10 @@ class UnicodeTextInserter:
                 partial=sent > 0,
             ) from error
 
-    def insert(self, text: str) -> None:
+    @staticmethod
+    def _validated_text(text: str) -> str:
+        if not isinstance(text, str):
+            raise TypeError("text must be str")
         # Preserve dictated layout as Unicode text. CRLF is normalized first so
         # Windows line endings never become two line breaks; neither newline nor
         # tab is emitted as a physical VK_RETURN/VK_TAB key event.
@@ -106,6 +141,15 @@ class UnicodeTextInserter:
                 "Text contains an unsupported control or surrogate character",
                 partial=False,
             )
+        return normalized
+
+    def insert(
+        self,
+        text: str,
+        *,
+        before_batch: Callable[[], bool] | None = None,
+    ) -> None:
+        normalized = self._validated_text(text)
         events: list[INPUT] = []
         prior_batch_sent = False
         for character in normalized:
@@ -118,17 +162,70 @@ class UnicodeTextInserter:
                 )
             if len(events) >= self.chunk_size * 2:
                 try:
-                    self._send(events)
+                    if before_batch is None:
+                        self._send(events)
+                    else:
+                        self._send(events, before_batch=before_batch)
                 except TextInsertionError as exc:
                     if prior_batch_sent and not exc.partial:
-                        raise TextInsertionError(str(exc), partial=True) from exc
+                        raise TextInsertionError(
+                            str(exc),
+                            partial=True,
+                            reason_code=exc.reason_code,
+                        ) from exc
                     raise
                 prior_batch_sent = True
                 events.clear()
                 time.sleep(0.002)
         try:
-            self._send(events)
+            if before_batch is None:
+                self._send(events)
+            else:
+                self._send(events, before_batch=before_batch)
         except TextInsertionError as exc:
             if prior_batch_sent and not exc.partial:
-                raise TextInsertionError(str(exc), partial=True) from exc
+                raise TextInsertionError(
+                    str(exc),
+                    partial=True,
+                    reason_code=exc.reason_code,
+                ) from exc
             raise
+
+    def replace_selection(self, text: str) -> None:
+        """Replace an already verified selection without using the clipboard.
+
+        Non-empty Unicode input naturally replaces the active selection.  An
+        empty replacement uses one Backspace key event, which deletes only the
+        selection prepared and re-checked by the session editor.
+        """
+
+        normalized = self._validated_text(text)
+        if normalized:
+            self.insert(normalized)
+            return
+        self._send(
+            [
+                _key_event(VK_BACK, 0, 0),
+                _key_event(VK_BACK, 0, KEYEVENTF_KEYUP),
+            ]
+        )
+
+    def replace_selection_guarded(
+        self,
+        text: str,
+        *,
+        before_batch: Callable[[], bool],
+    ) -> None:
+        """Replace a selection only while every SendInput batch stays authorized."""
+
+        normalized = self._validated_text(text)
+        if normalized:
+            self.insert(normalized, before_batch=before_batch)
+            return
+        self._send(
+            [
+                _key_event(VK_BACK, 0, 0),
+                _key_event(VK_BACK, 0, KEYEVENTF_KEYUP),
+            ],
+            before_batch=before_batch,
+        )

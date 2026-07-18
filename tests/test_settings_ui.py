@@ -11,12 +11,14 @@ from voicetype_local.settings_ui import (
     ACTIVATION_KEY_OPTIONS,
     CLOUD_TEXT_WARNING,
     CLOUD_TRANSCRIPTION_WARNING,
+    INTERACTION_MODE_OPTIONS,
     OVERLAY_CONTRAST_OPTIONS,
     OVERLAY_POSITION_OPTIONS,
     OVERLAY_SIZE_OPTIONS,
     SettingsFormModel,
     SettingsWindow,
     SettingsValidationError,
+    _microphone_options,
     open_settings_window,
 )
 
@@ -24,6 +26,7 @@ from voicetype_local.settings_ui import (
 def test_form_loads_non_secret_settings_without_tk() -> None:
     settings = SimpleNamespace(
         language="es",
+        microphone="USB Speech Microphone",
         activation_key="f9",
         dictation_commands_enabled=False,
         remove_fillers=True,
@@ -40,6 +43,7 @@ def test_form_loads_non_secret_settings_without_tk() -> None:
     values = SettingsFormModel(settings).values
 
     assert values.language == "es"
+    assert values.microphone == "USB Speech Microphone"
     assert values.activation_key == "f9"
     assert values.dictation_commands_enabled is False
     assert values.remove_fillers is True
@@ -51,6 +55,29 @@ def test_form_loads_non_secret_settings_without_tk() -> None:
     assert values.cloud_transcription_model == "whisper-1"
     assert values.local_model == "qwen2.5:3b"
     assert not hasattr(values, "api_key")
+
+
+def test_microphone_round_trips_and_is_bounded_without_tk() -> None:
+    model = SettingsFormModel(Settings(microphone="USB Speech Microphone"))
+
+    assert model.values.microphone == "USB Speech Microphone"
+    assert model.changes()["microphone"] == "USB Speech Microphone"
+
+    model.update(microphone="x" * 257)
+    assert "microphone" in model.validation_errors()
+
+
+def test_microphone_choices_include_default_current_and_deduplicate() -> None:
+    choices = _microphone_options(
+        "Current microphone",
+        ("Desk microphone", "Current microphone", "Desk microphone", ""),
+    )
+
+    assert choices == (
+        ("default", "По умолчанию"),
+        ("Current microphone", "Current microphone"),
+        ("Desk microphone", "Desk microphone"),
+    )
 
 
 def test_form_malformed_consents_fail_closed_without_store_wrapper() -> None:
@@ -518,19 +545,34 @@ def test_public_factory_and_window_constructor_keep_callback_contract_in_sync() 
         "has_raw_text",
         "status_text",
         "has_saved_secret",
+        "microphone_options",
+        "last_text",
+        "last_raw_text",
+        "runtime_feedback",
     }
     assert optional_callbacks <= set(factory)
     assert optional_callbacks <= set(constructor)
     assert set(factory) == set(constructor) - {"self"}
 
 
-def test_constructor_uses_five_tab_build_not_legacy_builder() -> None:
+def test_constructor_uses_dark_side_navigation_build_not_legacy_builder() -> None:
     source = inspect.getsource(SettingsWindow.__init__)
     assert "self._build()" in source
     assert "self._build_legacy()" not in source
     build_source = inspect.getsource(SettingsWindow._build)
-    for title in ("Главная", "Речь", "Текст", "Приватность", "Доступность"):
+    for title in (
+        "Главная",
+        "Речь",
+        "Текст",
+        "Приватность",
+        "Доступность",
+        "О программе",
+    ):
         assert f'text="{title}"' in build_source
+    assert "self._nav_buttons" in build_source
+    assert "self._select_page" in build_source
+    assert 'style="VoiceType.Dark.TNotebook"' in build_source
+    assert "theme_use" not in inspect.getsource(SettingsWindow._configure_styles)
     for variable in (
         "self._dictation_commands_var",
         "self._remove_fillers_var",
@@ -540,6 +582,191 @@ def test_constructor_uses_five_tab_build_not_legacy_builder() -> None:
     assert "Понимать «точка»" in build_source
     assert "Убирать безопасные слова-паразиты" in build_source
     assert "Добавлять пробел между диктовками" in build_source
+
+
+def test_home_mode_cards_map_to_existing_interaction_values() -> None:
+    source = inspect.getsource(SettingsWindow._build)
+
+    assert '("mixed", "Обычный\\nТекст + точные команды")' in source
+    assert '("dictation", "Диктовка\\nТолько текст")' in source
+    assert '("commands", "Управление\\nТолько команды")' in source
+    assert {value for value, _label in INTERACTION_MODE_OPTIONS} == {
+        "dictation",
+        "commands",
+        "mixed",
+    }
+
+
+def test_home_language_hint_explains_auto_tradeoff_without_changing_default() -> None:
+    source = inspect.getsource(SettingsWindow._build)
+
+    assert "Auto — для смешанной речи. RU / EN / ES — обычно быстрее." in source
+    assert Settings().language == "auto"
+
+
+def test_mode_card_selection_uses_form_value_without_saving_immediately() -> None:
+    class _Var:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    class _Button:
+        def configure(self, **_values: object) -> None:
+            return
+
+    window = SettingsWindow.__new__(SettingsWindow)
+    window._interaction_mode_var = _Var("Диктовка — печатать текст")
+    window._mode_card_buttons = {
+        "mixed": _Button(),
+        "dictation": _Button(),
+        "commands": _Button(),
+    }
+
+    window._choose_interaction_mode("mixed")
+
+    assert window._interaction_mode_var.value == (
+        "Смешанный — команды со словом «команда»"
+    )
+
+
+def test_runtime_feedback_poll_updates_only_ram_view_values() -> None:
+    class _Var:
+        def __init__(self, value: str = "") -> None:
+            self.value = value
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    class _Label:
+        def __init__(self) -> None:
+            self.values: dict[str, object] = {}
+
+        def configure(self, **values: object) -> None:
+            self.values.update(values)
+
+    class _Window:
+        def after(self, milliseconds: int, _callback: object) -> str:
+            assert milliseconds == 300
+            return "feedback-job"
+
+    window = SettingsWindow.__new__(SettingsWindow)
+    window._closed = False
+    window._runtime_feedback = lambda: {
+        "heard": "напиши другу",
+        "text": "Напиши другу",
+        "command": "Нет команды",
+        "outcome": "Текст готов",
+        "tone": "success",
+    }
+    window._feedback_vars = {
+        key: _Var()
+        for key in ("heard", "text", "command", "outcome")
+    }
+    window._last_result_var = _Var()
+    window._feedback_value_labels = {"outcome": _Label()}
+    window.window = _Window()
+    window._feedback_after_id = None
+
+    window._poll_runtime_feedback()
+
+    assert window._feedback_vars["heard"].value == "напиши другу"
+    assert window._feedback_vars["text"].value == "Напиши другу"
+    assert window._last_result_var.value == "Напиши другу"
+    assert window._feedback_value_labels["outcome"].values["fg"] == "#38C75B"
+    assert window._feedback_after_id == "feedback-job"
+
+
+def test_runtime_feedback_poll_clears_stale_last_result_for_empty_text() -> None:
+    class _Var:
+        def __init__(self, value: str = "") -> None:
+            self.value = value
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    class _Label:
+        def configure(self, **_values: object) -> None:
+            return
+
+    class _Window:
+        def after(self, _milliseconds: int, _callback: object) -> str:
+            return "feedback-job"
+
+    window = SettingsWindow.__new__(SettingsWindow)
+    window._closed = False
+    window._runtime_feedback = lambda: {"text": ""}
+    window._feedback_vars = {
+        key: _Var()
+        for key in ("heard", "text", "command", "outcome")
+    }
+    window._last_result_var = _Var("Старый результат")
+    window._feedback_value_labels = {"outcome": _Label()}
+    window.window = _Window()
+    window._feedback_after_id = None
+
+    window._poll_runtime_feedback()
+
+    assert window._feedback_vars["text"].value == "Пока нет данных"
+    assert window._last_result_var.value == "Пока ничего не продиктовано"
+
+
+def test_clear_session_text_updates_open_window_and_disables_actions() -> None:
+    class _Var:
+        def __init__(self, value: str = "") -> None:
+            self.value = value
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    class _Button:
+        def __init__(self) -> None:
+            self.values: dict[str, object] = {}
+
+        def configure(self, **values: object) -> None:
+            self.values.update(values)
+
+    calls: list[str] = []
+    final_button = _Button()
+    raw_button = _Button()
+    clear_button = _Button()
+    window = SettingsWindow.__new__(SettingsWindow)
+    window._closed = False
+    window._on_clear_session = lambda: calls.append("clear")
+    window._status_var = _Var()
+    window._last_text = "Исправленный текст"
+    window._last_raw_text = "исходный текст"
+    window._has_last_text = True
+    window._has_raw_text = True
+    window._last_result_var = _Var("Исправленный текст")
+    window._last_text_action_buttons = [final_button]
+    window._raw_text_action_buttons = [raw_button]
+    window._clear_session_button = clear_button
+
+    window._clear_session_text()
+
+    assert calls == ["clear"]
+    assert window._last_text == ""
+    assert window._last_raw_text == ""
+    assert window._has_last_text is False
+    assert window._has_raw_text is False
+    assert window._last_result_var.value == "Пока ничего не продиктовано"
+    for action_button in (final_button, raw_button, clear_button):
+        assert action_button.values == {"state": "disabled", "cursor": "arrow"}
+
+
+def test_runtime_feedback_preview_is_bounded_without_losing_word_spacing() -> None:
+    preview = SettingsWindow._feedback_value("слово  " * 80, "пусто")
+
+    assert 150 <= len(preview) <= 160
+    assert preview.endswith("…")
+    assert "  " not in preview
+    assert SettingsWindow._feedback_value("   ", "пусто") == "пусто"
+    assert len(SettingsWindow._feedback_value("длинный текст" * 10, "пусто", limit=32)) <= 32
 
 
 def test_optional_actions_and_leave_actions_have_safe_lifecycle() -> None:

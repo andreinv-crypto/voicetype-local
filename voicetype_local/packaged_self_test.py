@@ -19,6 +19,9 @@ REQUIRED_CONTROL_MODULES = (
     "voicetype_local.voice_control",
     "voicetype_local.voice_commands",
     "voicetype_local.dictation_transform",
+    "voicetype_local.session_editing",
+    "voicetype_local.session_editor",
+    "voicetype_local.windows_session_editor_probe",
 )
 
 REQUIRED_CONTROL_SYMBOLS = {
@@ -29,6 +32,11 @@ REQUIRED_CONTROL_SYMBOLS = {
     "voicetype_local.voice_control": ("VoiceControlRouter",),
     "voicetype_local.voice_commands": ("VoiceCommandParser",),
     "voicetype_local.dictation_transform": ("transform_dictation",),
+    "voicetype_local.session_editing": ("SessionEditCommandParser",),
+    "voicetype_local.session_editor": ("SessionTextEditor",),
+    "voicetype_local.windows_session_editor_probe": (
+        "run_isolated_session_editor_probe",
+    ),
 }
 
 

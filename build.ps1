@@ -61,6 +61,9 @@ if ($LASTEXITCODE -ne 0) { throw "Icon generation failed." }
     --hidden-import voicetype_local.voice_control `
     --hidden-import voicetype_local.voice_commands `
     --hidden-import voicetype_local.dictation_transform `
+    --hidden-import voicetype_local.session_editing `
+    --hidden-import voicetype_local.session_editor `
+    --hidden-import voicetype_local.windows_session_editor_probe `
     --exclude-module IPython `
     --exclude-module _pytest `
     --exclude-module comtypes.test `

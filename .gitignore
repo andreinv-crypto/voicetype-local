@@ -1,8 +1,8 @@
 .venv/
 build/
-build_candidate/
+build_candidate*/
 dist/
-dist_candidate/
+dist_candidate*/
 dist_previous_*/
 dist_swap_*/
 models/
@@ -34,3 +34,13 @@ __pycache__/
 *.ogg
 *.sqlite3
 voicetype-memory-export*.json
+
+# Local Wispr Flow reference captures contain private dictations and account data.
+audit/2026-07-17-wispr-flow/
+
+# Local VoiceType UX/candidate review captures can contain session text,
+# personal defaults, and intermediate visual experiments.  Keep the public
+# repository limited to product source, tests, and generic documentation.
+audit/2026-07-17-voicetype-candidate/
+audit/2026-07-17-voicetype-ux/
+design-qa.md

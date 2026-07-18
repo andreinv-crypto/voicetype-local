@@ -307,40 +307,66 @@ class NumberOverlay:
 
 _COMMAND_HELP = {
     "Русский": (
-        "Режим «Команды»: говорите команду сразу.\n"
-        "Смешанный режим: начинайте со слова «команда».\n\n"
+        "Режим «Диктовка»: печатается только текст.\n"
+        "Режим «Управление»: говорите команду сразу.\n"
+        "Режим «Обычный» (смешанный): текст печатается; любую команду "
+        "начинайте со слова «команда».\n"
+        "В конце текста можно сказать «нажать Enter» или «отправить сообщение».\n\n"
         "помощь · покажи номера · нажми номер 7\n"
         "открой Блокнот · переключись на Chrome\n"
         "сверни окно · разверни окно\n"
         "прокрути вниз · нажми на Настройки\n"
         "нажми клавиши контрол си\n"
         "повтори последнее · скопируй последнее\n"
+        "команда удали последнее слово · удали последнее предложение\n"
+        "команда замени черновик на готовый текст\n"
+        "команда замени последнее предложение на Готово.\n"
+        "команда верни последнее исправление\n"
         "отмена · подтверждаю\n\n"
-        "Удаление, отправка, Enter и другие чувствительные действия требуют "
+        "Правка работает только с последней подтверждённой вставкой VoiceType "
+        "в том же поле и при неизменённом курсоре. Замена выполняется, только "
+        "если фраза найдена ровно один раз.\n\n"
+        "Низкоуровневые Delete/Backspace, отправка, Enter и другие чувствительные действия требуют "
         "отдельного подтверждения. Terminal, UAC и команды администратора запрещены."
     ),
     "Español": (
-        "Modo Comandos: diga la orden directamente.\n"
-        "Modo Mixto: empiece con «comando».\n\n"
+        "Modo Dictado: solo se escribe texto.\n"
+        "Modo Control: diga la orden directamente.\n"
+        "Modo Normal (mixto): el texto se escribe; empiece cualquier orden con «comando».\n"
+        "Al final del texto puede decir «pulsa Intro» o «enviar mensaje».\n\n"
         "ayuda · muestra los números · haz clic en el número 7\n"
         "abre Bloc de notas · cambia a Chrome\n"
         "minimiza la ventana · maximiza la ventana\n"
         "desplaza hacia abajo · pulsa Configuración\n"
         "pulsa Control C · repite lo último · copia lo último\n"
+        "comando borra la última palabra · borra la última frase\n"
+        "comando reemplaza prueba por resultado\n"
+        "comando reemplaza la última frase por Listo.\n"
+        "comando restaura la última corrección\n"
         "cancelar · confirmo\n\n"
-        "Las acciones sensibles requieren confirmación. Terminal, UAC y "
+        "La edición solo toca la última inserción verificada de VoiceType en el "
+        "mismo campo y con el cursor intacto. La sustitución exige una sola coincidencia.\n\n"
+        "Delete/Retroceso, enviar, Intro y otras acciones sensibles requieren confirmación. Terminal, UAC y "
         "acciones de administrador están bloqueados."
     ),
     "English": (
-        "Commands mode: say the command directly.\n"
-        "Mixed mode: begin with “command”.\n\n"
+        "Dictation mode: only text is typed.\n"
+        "Control mode: say the command directly.\n"
+        "Everyday (mixed) mode: text is typed; begin any command with “command”.\n"
+        "At the end of text, say “press Enter” or “send message”.\n\n"
         "help · show numbers · click number 7\n"
         "open Notepad · switch to Chrome\n"
         "minimize window · maximize window\n"
         "scroll down · click Settings\n"
         "press Control C · repeat last · copy last\n"
+        "command delete last word · delete last sentence\n"
+        "command replace test with result\n"
+        "command replace last sentence with Done.\n"
+        "command restore last voice edit\n"
         "cancel · confirm\n\n"
-        "Sensitive actions require confirmation. Terminal, UAC and administrator "
+        "Editing only touches VoiceType’s last verified insertion in the same "
+        "field with an unchanged caret. Replacement requires exactly one match.\n\n"
+        "Delete/Backspace, sending, Enter and other sensitive actions require confirmation. Terminal, UAC and administrator "
         "actions are blocked."
     ),
 }
@@ -366,8 +392,8 @@ class CommandHelpWindow:
         window = tk.Toplevel(self.root)
         self.window = window
         window.title("VoiceType Control — Что можно сказать")
-        window.geometry("760x560")
-        window.minsize(620, 460)
+        window.geometry("800x650")
+        window.minsize(660, 520)
         window.protocol("WM_DELETE_WINDOW", self.close)
         window.bind("<Escape>", lambda _event: self.close())
         shell = ttk.Frame(window, padding=18)
@@ -458,9 +484,9 @@ class TrayController:
                 pystray.MenuItem(
                     "Режим речи",
                     pystray.Menu(
+                        self._mode_item("Обычный", "mixed", on_mode),
                         self._mode_item("Диктовка", "dictation", on_mode),
-                        self._mode_item("Команды", "commands", on_mode),
-                        self._mode_item("Смешанный", "mixed", on_mode),
+                        self._mode_item("Управление", "commands", on_mode),
                     ),
                 ),
                 pystray.MenuItem(

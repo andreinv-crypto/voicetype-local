@@ -38,6 +38,14 @@ def _self_test() -> int:
     if control_code:
         return control_code
 
+    from voicetype_local.windows_session_editor_probe import (
+        run_isolated_session_editor_probe,
+    )
+
+    editor_code, _editor_label = run_isolated_session_editor_probe()
+    if editor_code:
+        return editor_code
+
     from voicetype_local.audio import AudioRecorder
     from voicetype_local.config import Settings
     from voicetype_local.inserter import INPUT, UnicodeTextInserter
