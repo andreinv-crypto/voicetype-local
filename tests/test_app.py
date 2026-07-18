@@ -225,6 +225,11 @@ def _bare_app() -> VoiceTypeApp:
     app._actions = queue.Queue()
     app._record_timer = None
     app._closing = False
+    app._activation_waiter = None
+    app._activation_listener_stop = threading.Event()
+    app._activation_listener_thread = None
+    app._open_settings_on_start = False
+    app._silent_start = False
     app._settings_window = None
     app._microphone_options_cache = ()
     app._microphone_scan_lock = threading.Lock()
@@ -234,6 +239,40 @@ def _bare_app() -> VoiceTypeApp:
     app._recorder_factory = lambda: app.recorder
     app._sound = lambda _alias: None  # type: ignore[method-assign]
     return app
+
+
+def test_instance_activation_listener_posts_settings_on_ui_queue() -> None:
+    app = _bare_app()
+    responses = iter((True, False))
+    waits: list[int] = []
+
+    def wait_for_activation(timeout_ms: int) -> bool:
+        waits.append(timeout_ms)
+        requested = next(responses)
+        if not requested:
+            app._activation_listener_stop.set()
+        return requested
+
+    app._activation_waiter = wait_for_activation
+    app._activation_listener_loop()
+
+    queued = app._actions.get_nowait()
+    assert queued == app.open_settings
+    assert waits == [250, 250]
+
+
+def test_silent_start_suppresses_model_ready_overlay_only() -> None:
+    app = _bare_app()
+    app.state = AppState.LOADING
+    app._model_load_started_at = 0.0
+    app._silent_start = True
+
+    app._model_ready()
+
+    assert app.state == AppState.IDLE
+    assert app.overlay.messages == []
+    app._show_status("● Слушаю…", "recording")
+    assert app.overlay.messages == [("● Слушаю…", "recording", None)]
 
 
 def test_microphone_start_never_blocks_the_ui(monkeypatch) -> None:

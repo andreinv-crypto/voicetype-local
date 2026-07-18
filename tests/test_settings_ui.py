@@ -19,6 +19,7 @@ from voicetype_local.settings_ui import (
     SettingsWindow,
     SettingsValidationError,
     _microphone_options,
+    _visible_toplevel_owner,
     open_settings_window,
 )
 
@@ -77,6 +78,24 @@ def test_microphone_choices_include_default_current_and_deduplicate() -> None:
         ("default", "По умолчанию"),
         ("Current microphone", "Current microphone"),
         ("Desk microphone", "Desk microphone"),
+    )
+
+
+def test_hidden_tray_root_is_not_used_as_settings_owner() -> None:
+    hidden_owner = SimpleNamespace(winfo_viewable=lambda: 0)
+    visible_owner = SimpleNamespace(winfo_viewable=lambda: 1)
+
+    assert (
+        _visible_toplevel_owner(
+            SimpleNamespace(winfo_toplevel=lambda: hidden_owner)
+        )
+        is None
+    )
+    assert (
+        _visible_toplevel_owner(
+            SimpleNamespace(winfo_toplevel=lambda: visible_owner)
+        )
+        is visible_owner
     )
 
 

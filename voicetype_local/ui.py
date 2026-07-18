@@ -522,6 +522,10 @@ class TrayController:
                 pystray.MenuItem(
                     "Настройки и приватность…",
                     lambda *_: on_settings() if on_settings is not None else None,
+                    # pystray invokes the default item when the tray icon is
+                    # activated with the primary button on Windows.  Keeping
+                    # this item visible preserves the existing context menu.
+                    default=True,
                 ),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Выход", lambda *_: on_exit()),

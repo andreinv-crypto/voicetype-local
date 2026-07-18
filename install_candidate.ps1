@@ -32,9 +32,11 @@ if (Get-Process -Name "VoiceType Local" -ErrorAction SilentlyContinue) {
 }
 
 $Shell = New-Object -ComObject WScript.Shell
+$DesktopShortcutPath = Join-Path ([Environment]::GetFolderPath("Desktop")) "VoiceType Local.lnk"
+$StartupShortcutPath = Join-Path ([Environment]::GetFolderPath("Startup")) "VoiceType Local.lnk"
 $ShortcutPaths = @(
-    (Join-Path ([Environment]::GetFolderPath("Desktop")) "VoiceType Local.lnk"),
-    (Join-Path ([Environment]::GetFolderPath("Startup")) "VoiceType Local.lnk")
+    $DesktopShortcutPath,
+    $StartupShortcutPath
 )
 
 function Save-ShortcutManifest {
@@ -61,7 +63,22 @@ function Save-ShortcutManifest {
     $Document = [ordered]@{
         schema = 1
         captured_at_utc = [DateTime]::UtcNow.ToString("o")
+        shortcuts_updated = $true
         shortcuts = $Records
+    }
+    $Temporary = "$ShortcutManifest.tmp"
+    $Document | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Temporary -Encoding UTF8
+    Move-Item -LiteralPath $Temporary -Destination $ShortcutManifest -Force
+}
+
+function Save-UnchangedShortcutState {
+    # Invalidate any manifest left by an older installation.  Rollback must
+    # not touch shortcuts when this installation explicitly skipped them.
+    $Document = [ordered]@{
+        schema = 1
+        captured_at_utc = [DateTime]::UtcNow.ToString("o")
+        shortcuts_updated = $false
+        shortcuts = @()
     }
     $Temporary = "$ShortcutManifest.tmp"
     $Document | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Temporary -Encoding UTF8
@@ -163,17 +180,32 @@ try {
     Invoke-SelfTest $InstalledExe "Installed"
 
     if (-not $SkipShortcutUpdate) {
-        foreach ($ShortcutPath in $ShortcutPaths) {
-            $Shortcut = $Shell.CreateShortcut($ShortcutPath)
+        $InstalledShortcutSpecs = @(
+            [ordered]@{
+                path = $DesktopShortcutPath
+                arguments = ""
+                description = "VoiceType Local - open settings"
+            },
+            [ordered]@{
+                path = $StartupShortcutPath
+                arguments = "--background"
+                description = "VoiceType Local - background startup"
+            }
+        )
+        foreach ($ShortcutSpec in $InstalledShortcutSpecs) {
+            $Shortcut = $Shell.CreateShortcut([string]$ShortcutSpec.path)
             $Shortcut.TargetPath = $InstalledExe
-            $Shortcut.Arguments = ""
+            $Shortcut.Arguments = [string]$ShortcutSpec.arguments
             $Shortcut.WorkingDirectory = $InstallRoot
             $Shortcut.IconLocation = "$InstalledExe,0"
-            $Shortcut.Description = "VoiceType Local"
+            $Shortcut.Description = [string]$ShortcutSpec.description
             $Shortcut.Hotkey = ""
             $Shortcut.WindowStyle = 1
             $Shortcut.Save()
         }
+    }
+    else {
+        Save-UnchangedShortcutState
     }
 
     if (-not $NoLaunch) {

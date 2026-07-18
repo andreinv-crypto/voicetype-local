@@ -1,33 +1,11 @@
 import ctypes
 import multiprocessing
-import os
 import sys
 import tempfile
 from pathlib import Path
 
 from voicetype_local.app import run_app, run_ui_smoke
-
-
-def _close_handle(handle: int) -> None:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-    kernel32.CloseHandle.restype = ctypes.c_bool
-    kernel32.CloseHandle(ctypes.c_void_p(handle))
-
-
-def _single_instance() -> int | None:
-    if os.name != "nt":
-        return None
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    handle = kernel32.CreateMutexW(None, False, "Local\\VoiceTypeLocal-4A5B2A94")
-    if not handle:
-        return None
-    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-        _close_handle(int(handle))
-        return 0
-    return int(handle)
+from voicetype_local.instance_activation import InstanceActivation
 
 
 def _self_test() -> int:
@@ -76,18 +54,37 @@ def _self_test() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
     multiprocessing.freeze_support()
-    if "--self-test" in sys.argv:
-        raise SystemExit(_self_test())
-    if "--ui-smoke-test" in sys.argv:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if "--self-test" in arguments:
+        return _self_test()
+    if "--ui-smoke-test" in arguments:
         run_ui_smoke()
-        raise SystemExit(0)
-    mutex = _single_instance()
-    if mutex == 0:
-        raise SystemExit(0)
+        return 0
+
+    background = "--background" in arguments
+    activation = InstanceActivation.acquire()
+    if not activation.is_primary:
+        try:
+            # Startup is deliberately silent. A normal Desktop launch is a
+            # user request to surface the already-running application's UI.
+            if not background:
+                activation.notify_settings()
+        finally:
+            activation.close()
+        return 0
+
     try:
-        run_app()
+        run_app(
+            activation_waiter=activation.wait_for_settings,
+            open_settings_on_start=not background,
+            silent_start=background,
+        )
     finally:
-        if mutex:
-            _close_handle(mutex)
+        activation.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

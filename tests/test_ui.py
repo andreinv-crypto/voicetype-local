@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import voicetype_local.ui as ui_module
-from voicetype_local.ui import StatusOverlay
+from voicetype_local.ui import StatusOverlay, TrayController
 
 
 class _Label:
@@ -92,3 +93,43 @@ def test_overlay_invalid_preferences_fail_closed_and_position_is_applied(
         "top",
     )
     assert positions[-1][3:5] == (28, 300)
+
+
+def _tray(*, on_settings: Callable[[], None] | None) -> TrayController:
+    return TrayController(
+        on_toggle=lambda: None,
+        on_cancel=lambda: None,
+        on_insert_last=lambda: None,
+        on_copy_last=lambda: None,
+        on_language=lambda _language: None,
+        on_exit=lambda: None,
+        get_language=lambda: "auto",
+        has_last_text=lambda: False,
+        on_settings=on_settings,
+    )
+
+
+def test_tray_activation_opens_settings_and_keeps_visible_menu_item() -> None:
+    opened: list[str] = []
+    tray = _tray(on_settings=lambda: opened.append("settings"))
+
+    settings_item = next(
+        item
+        for item in tray.icon.menu.items
+        if item.text == "Настройки и приватность…"
+    )
+
+    assert settings_item.visible is True
+    assert settings_item.default is True
+
+    # pystray dispatches primary icon activation through the menu's default
+    # item; invoke that public behaviour directly without starting a GUI loop.
+    tray.icon.menu(tray.icon)
+
+    assert opened == ["settings"]
+
+
+def test_tray_activation_is_safe_when_settings_callback_is_absent() -> None:
+    tray = _tray(on_settings=None)
+
+    assert tray.icon.menu(tray.icon) is None

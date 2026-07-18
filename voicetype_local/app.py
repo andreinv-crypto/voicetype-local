@@ -96,7 +96,13 @@ def _style_initial_prompt(language: str) -> str:
 
 
 class VoiceTypeApp:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        activation_waiter: Callable[[int], bool] | None = None,
+        open_settings_on_start: bool = False,
+        silent_start: bool = False,
+    ) -> None:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("VoiceType Local")
@@ -186,6 +192,11 @@ class VoiceTypeApp:
         self._actions: queue.Queue[Callable[[], None]] = queue.Queue()
         self._record_timer: threading.Timer | None = None
         self._closing = False
+        self._activation_waiter = activation_waiter
+        self._activation_listener_stop = threading.Event()
+        self._activation_listener_thread: threading.Thread | None = None
+        self._open_settings_on_start = bool(open_settings_on_start)
+        self._silent_start = bool(silent_start)
         self._settings_window: SettingsWindow | None = None
         self._memory_window: MemoryWindow | None = None
         self._microphone_options_cache: tuple[str, ...] = ()
@@ -289,6 +300,37 @@ class VoiceTypeApp:
     def request_settings(self) -> None:
         self.post(self.open_settings)
 
+    def _start_activation_listener(self) -> None:
+        if self._activation_waiter is None:
+            return
+        listener = self._activation_listener_thread
+        if listener is not None and listener.is_alive():
+            return
+        listener = threading.Thread(
+            target=self._activation_listener_loop,
+            name="instance-activation",
+            daemon=True,
+        )
+        self._activation_listener_thread = listener
+        listener.start()
+
+    def _activation_listener_loop(self) -> None:
+        waiter = self._activation_waiter
+        if waiter is None:
+            return
+        while not self._activation_listener_stop.is_set():
+            try:
+                requested = waiter(250)
+            except Exception as exc:
+                self.logger.event(
+                    "instance_activation_failed",
+                    operation="wait_for_settings",
+                    error_type=type(exc).__name__,
+                )
+                return
+            if requested and not self._activation_listener_stop.is_set():
+                self.request_settings()
+
     def request_memory(self) -> None:
         self.post(self.open_memory)
 
@@ -320,6 +362,11 @@ class VoiceTypeApp:
                     existing.window.deiconify()
                     existing.window.lift()
                     existing.window.focus_force()
+                    self.logger.event(
+                        "settings_window_opened",
+                        operation="show_settings",
+                        code="existing",
+                    )
                     return
             except tk.TclError:
                 pass
@@ -352,6 +399,11 @@ class VoiceTypeApp:
                 AppState.PENDING_INSERT: "Текст ждёт вставки",
                 AppState.ERROR: "Нужна проверка ошибки",
             }.get(self.state, "VoiceType запущен"),
+        )
+        self.logger.event(
+            "settings_window_opened",
+            operation="show_settings",
+            code="created",
         )
         self._start_microphone_scan()
 
@@ -591,11 +643,12 @@ class VoiceTypeApp:
             self._model_load_started_at = 0.0
         self._set_state(AppState.IDLE, "готов")
         settings = self.settings_store.get()
-        self._show_status(
-            f"✓ Готово — {activation_label(settings.activation_key, settings.activation_mode)}",
-            "success",
-            1800,
-        )
+        if not self._silent_start:
+            self._show_status(
+                f"✓ Готово — {activation_label(settings.activation_key, settings.activation_mode)}",
+                "success",
+                1800,
+            )
 
     def _model_failed(self, error: Exception) -> None:
         self._set_state(AppState.ERROR, "ошибка модели")
@@ -2358,6 +2411,7 @@ class VoiceTypeApp:
         if self._closing:
             return
         self._closing = True
+        self._activation_listener_stop.set()
         self._generation += 1
         self._cancel_timer()
         self._clear_pending_dictation_action()
@@ -2398,6 +2452,9 @@ class VoiceTypeApp:
         worker_cleanup.start()
         self.hotkeys.stop()
         self.tray.stop()
+        activation_listener = self._activation_listener_thread
+        if activation_listener is not None:
+            activation_listener.join(timeout=0.35)
         cleanup.join(timeout=0.4)
         worker_cleanup.join(timeout=1.0)
         try:
@@ -2415,11 +2472,15 @@ class VoiceTypeApp:
         self.root.quit()
 
     def run(self, smoke_timeout_ms: int | None = None) -> None:
-        self._show_status("Загружаю локальную модель…", "loading")
+        if not self._silent_start:
+            self._show_status("Загружаю локальную модель…", "loading")
         self.tray.start()
         self.hotkeys.start()
+        self._start_activation_listener()
         self.root.after(35, self._drain_actions)
         self.root.after(2000, self._watch_hotkeys)
+        if self._open_settings_on_start:
+            self.root.after(0, self.request_settings)
         if smoke_timeout_ms is not None:
             self.root.after(smoke_timeout_ms, self.exit)
         self._model_load_started_at = time.monotonic()
@@ -2431,10 +2492,20 @@ class VoiceTypeApp:
                 self.exit()
 
 
-def run_app(smoke_timeout_ms: int | None = None) -> None:
+def run_app(
+    smoke_timeout_ms: int | None = None,
+    *,
+    activation_waiter: Callable[[int], bool] | None = None,
+    open_settings_on_start: bool = False,
+    silent_start: bool = False,
+) -> None:
     if os.name != "nt":
         raise SystemExit("VoiceType Local currently supports Windows only.")
-    VoiceTypeApp().run(smoke_timeout_ms)
+    VoiceTypeApp(
+        activation_waiter=activation_waiter,
+        open_settings_on_start=open_settings_on_start,
+        silent_start=silent_start,
+    ).run(smoke_timeout_ms)
 
 
 def run_ui_smoke(smoke_timeout_ms: int = 1200) -> None:

@@ -45,6 +45,21 @@ def _microphone_options(
         values.append((value, value))
     return tuple(values)
 
+
+def _visible_toplevel_owner(parent: tk.Misc) -> tk.Misc | None:
+    """Return a visible Tk owner, never a withdrawn tray root.
+
+    On Windows, making Settings transient to VoiceType's permanently withdrawn
+    root also hides the Settings window and prevents a taskbar button.  A
+    visible preview/test host can still own the window normally.
+    """
+
+    try:
+        owner = parent.winfo_toplevel()
+        return owner if bool(owner.winfo_viewable()) else None
+    except (AttributeError, tk.TclError):
+        return None
+
 ACTIVATION_KEY_OPTIONS: tuple[tuple[str, str], ...] = (
     ("right_ctrl", "Правый Ctrl"),
     ("f8", "F8"),
@@ -559,7 +574,9 @@ class SettingsWindow:
         self.window = tk.Toplevel(parent)
         self.window.withdraw()
         self.window.title("VoiceType Local — Настройки")
-        self.window.transient(parent.winfo_toplevel())
+        visible_owner = _visible_toplevel_owner(parent)
+        if visible_owner is not None:
+            self.window.transient(visible_owner)
         self.window.configure(background="#071827")
         self.window.minsize(1040, 680)
         screen_width = max(1040, self.window.winfo_screenwidth())
@@ -585,7 +602,8 @@ class SettingsWindow:
 
         self.window.update_idletasks()
         self.window.deiconify()
-        self.window.grab_set()
+        self.window.lift()
+        self.window.focus_force()
         self.window.after_idle(self._language_widget.focus_set)
 
     def _configure_styles(self) -> None:

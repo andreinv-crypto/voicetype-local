@@ -17,9 +17,11 @@ if (Get-Process -Name "VoiceType Local" -ErrorAction SilentlyContinue) {
 }
 
 $Shell = New-Object -ComObject WScript.Shell
+$DesktopShortcutPath = Join-Path ([Environment]::GetFolderPath("Desktop")) "VoiceType Local.lnk"
+$StartupShortcutPath = Join-Path ([Environment]::GetFolderPath("Startup")) "VoiceType Local.lnk"
 $ShortcutPaths = @(
-    (Join-Path ([Environment]::GetFolderPath("Desktop")) "VoiceType Local.lnk"),
-    (Join-Path ([Environment]::GetFolderPath("Startup")) "VoiceType Local.lnk")
+    $DesktopShortcutPath,
+    $StartupShortcutPath
 )
 
 function Read-ShortcutManifest {
@@ -34,6 +36,10 @@ function Read-ShortcutManifest {
 }
 
 function Restore-ShortcutManifest($Document) {
+    $UpdatedProperty = $Document.PSObject.Properties["shortcuts_updated"]
+    if ($null -ne $UpdatedProperty -and -not [bool]$UpdatedProperty.Value) {
+        return
+    }
     foreach ($ShortcutPath in $ShortcutPaths) {
         $Record = @($Document.shortcuts) | Where-Object { $_.path -eq $ShortcutPath } | Select-Object -First 1
         if ($null -eq $Record -or -not $Record.existed) {
@@ -60,13 +66,25 @@ function Restore-ShortcutManifest($Document) {
 
 function Set-InstalledShortcuts([string]$Executable) {
     $WorkingDirectory = Split-Path -Parent $Executable
-    foreach ($ShortcutPath in $ShortcutPaths) {
-        $Shortcut = $Shell.CreateShortcut($ShortcutPath)
+    $InstalledShortcutSpecs = @(
+        [ordered]@{
+            path = $DesktopShortcutPath
+            arguments = ""
+            description = "VoiceType Local - open settings"
+        },
+        [ordered]@{
+            path = $StartupShortcutPath
+            arguments = "--background"
+            description = "VoiceType Local - background startup"
+        }
+    )
+    foreach ($ShortcutSpec in $InstalledShortcutSpecs) {
+        $Shortcut = $Shell.CreateShortcut([string]$ShortcutSpec.path)
         $Shortcut.TargetPath = $Executable
-        $Shortcut.Arguments = ""
+        $Shortcut.Arguments = [string]$ShortcutSpec.arguments
         $Shortcut.WorkingDirectory = $WorkingDirectory
         $Shortcut.IconLocation = "$Executable,0"
-        $Shortcut.Description = "VoiceType Local"
+        $Shortcut.Description = [string]$ShortcutSpec.description
         $Shortcut.Hotkey = ""
         $Shortcut.WindowStyle = 1
         $Shortcut.Save()
@@ -85,6 +103,11 @@ function Invoke-SelfTest([string]$FilePath, [string]$Label) {
 }
 
 $Manifest = Read-ShortcutManifest
+$ShortcutsWereUpdated = $false
+if ($null -ne $Manifest) {
+    $UpdatedProperty = $Manifest.PSObject.Properties["shortcuts_updated"]
+    $ShortcutsWereUpdated = $null -eq $UpdatedProperty -or [bool]$UpdatedProperty.Value
+}
 $BackupExe = Join-Path $BackupRoot "VoiceType Local.exe"
 if (Test-Path -LiteralPath $BackupExe -PathType Leaf) {
     Invoke-SelfTest $BackupExe "Previous installation"
@@ -98,6 +121,9 @@ if (Test-Path -LiteralPath $BackupExe -PathType Leaf) {
         Move-Item -LiteralPath $BackupRoot -Destination $InstallRoot
         $Exe = Join-Path $InstallRoot "VoiceType Local.exe"
         Invoke-SelfTest $Exe "Rollback executable"
+        if ($ShortcutsWereUpdated) {
+            Restore-ShortcutManifest $Manifest
+        }
     }
     catch {
         if (Test-Path -LiteralPath $InstallRoot) {
@@ -105,6 +131,10 @@ if (Test-Path -LiteralPath $BackupExe -PathType Leaf) {
         }
         if (Test-Path -LiteralPath $FailedRoot) {
             Move-Item -LiteralPath $FailedRoot -Destination $InstallRoot
+        }
+        $RestoredCurrentExe = Join-Path $InstallRoot "VoiceType Local.exe"
+        if ($ShortcutsWereUpdated -and (Test-Path -LiteralPath $RestoredCurrentExe -PathType Leaf)) {
+            Set-InstalledShortcuts $RestoredCurrentExe
         }
         throw
     }

@@ -161,15 +161,20 @@
 Фактически реализованное и оставшиеся release-gates фиксируются отдельно в
 [`IMPLEMENTATION_STATUS_2026-07-17.md`](IMPLEMENTATION_STATUS_2026-07-17.md).
 
-Автоматическая проверка текущего исходного кода: **664 tests passed**;
+Автоматическая проверка текущего исходного кода: **677 tests passed**;
 встроенный self-test, UI smoke и изолированный реальный UIA-пробник прошли.
 Отдельный
-`dist_candidate_command_core_stable/VoiceType Local/VoiceType Local.exe` собран
+`dist_candidate_ui_activation3/VoiceType Local/VoiceType Local.exe` собран
 из этих же исходников; packaged self-test с UIA-пробником и packaged UI smoke
 также прошли. Это
 подтверждает кодовую основу, но не заменяет ручную проверку в реальных
 приложениях. Та же сборка установлена в `%LOCALAPPDATA%\Programs\VoiceType
 Local`; Desktop и Startup переключены с сохранённым rollback-манифестом.
+Их роли разделены и проверены на установленной сборке: Desktop открывает
+главное окно без второго экземпляра, Startup использует `--background` и не
+показывает ни окна настроек, ни стартового overlay. Повторный запуск сохранил два штатных процесса
+(приложение и worker) и поднял единственное существующее окно. Пользовательские
+настройки при установке не перезаписываются.
 
 Отдельный opt-in Chromium contenteditable-пробник в packaged self-test не
 включён: он требует установленный браузер и краткий фокус собственного
