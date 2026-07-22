@@ -541,11 +541,17 @@ class NativeControlBackend(Protocol):
     def scroll(self, direction: ScrollDirection, amount: int) -> BackendActionResult: ...
 
     def send_key(
-        self, key: str, expected_gate_token: str | None = None
+        self,
+        key: str,
+        expected_gate_token: str | None = None,
+        input_guard: Callable[[], bool] | None = None,
     ) -> BackendActionResult: ...
 
     def send_hotkey(
-        self, keys: tuple[str, ...], expected_gate_token: str | None = None
+        self,
+        keys: tuple[str, ...],
+        expected_gate_token: str | None = None,
+        input_guard: Callable[[], bool] | None = None,
     ) -> BackendActionResult: ...
 
 
@@ -1332,11 +1338,26 @@ class Win32ControlBackend:
         self._user32.ShowWindow(wintypes.HWND(hwnd), command)
         return BackendActionResult.success("win32")
 
-    def _send(self, events: Sequence[_INPUT]) -> BackendActionResult:
+    def _send(
+        self,
+        events: Sequence[_INPUT],
+        input_guard: Callable[[], bool] | None = None,
+    ) -> BackendActionResult:
         if not events:
             return BackendActionResult.unsupported("sendinput")
         array_type = _INPUT * len(events)
         array = array_type(*events)
+        if input_guard is not None:
+            try:
+                guard_passed = input_guard() is True
+            except Exception:
+                return BackendActionResult.blocked(
+                    "sendinput", "input_guard_failed"
+                )
+            if not guard_passed:
+                return BackendActionResult.blocked(
+                    "sendinput", "input_guard_rejected"
+                )
         sent = int(self._user32.SendInput(len(events), array, ctypes.sizeof(_INPUT)))
         return (
             BackendActionResult.success("sendinput")
@@ -1395,7 +1416,10 @@ class Win32ControlBackend:
         return hwnd, None
 
     def send_key(
-        self, key: str, expected_gate_token: str | None = None
+        self,
+        key: str,
+        expected_gate_token: str | None = None,
+        input_guard: Callable[[], bool] | None = None,
     ) -> BackendActionResult:
         controller_blocked = self._controller_blocked("win32")
         if controller_blocked is not None:
@@ -1406,10 +1430,13 @@ class Win32ControlBackend:
         _hwnd, blocked = self._foreground_for_input(expected_gate_token)
         if blocked is not None:
             return blocked
-        return self._send(events)
+        return self._send(events, input_guard)
 
     def send_hotkey(
-        self, keys: tuple[str, ...], expected_gate_token: str | None = None
+        self,
+        keys: tuple[str, ...],
+        expected_gate_token: str | None = None,
+        input_guard: Callable[[], bool] | None = None,
     ) -> BackendActionResult:
         controller_blocked = self._controller_blocked("win32")
         if controller_blocked is not None:
@@ -1421,7 +1448,7 @@ class Win32ControlBackend:
         _hwnd, blocked = self._foreground_for_input(expected_gate_token)
         if blocked is not None:
             return blocked
-        return self._send(events)
+        return self._send(events, input_guard)
 
 
 def make_optional_native_backend() -> NativeControlBackend | None:
@@ -2039,7 +2066,10 @@ class WindowsControlExecutor:
         return self._from_backend(request.intent, outcome, target_id)
 
     def _execute_key(
-        self, request: ControlRequest, context: _ExecutionContext
+        self,
+        request: ControlRequest,
+        context: _ExecutionContext,
+        input_guard: Callable[[], bool] | None,
     ) -> ControlResult:
         key = _canonical_key(request.key)
         if key not in _SAFE_KEYS and key not in _SENSITIVE_KEYS:
@@ -2085,13 +2115,21 @@ class WindowsControlExecutor:
         if self.native_backend is None:
             return self._native_unavailable(request)
         try:
-            outcome = self.native_backend.send_key(key, expected_gate_token)
+            if input_guard is None:
+                outcome = self.native_backend.send_key(key, expected_gate_token)
+            else:
+                outcome = self.native_backend.send_key(
+                    key, expected_gate_token, input_guard
+                )
         except Exception:
             outcome = BackendActionResult.failed("native")
         return self._from_backend(request.intent, outcome, f"key:{key.casefold()}")
 
     def _execute_hotkey(
-        self, request: ControlRequest, context: _ExecutionContext
+        self,
+        request: ControlRequest,
+        context: _ExecutionContext,
+        input_guard: Callable[[], bool] | None,
     ) -> ControlResult:
         keys = _canonical_hotkey(request.keys)
         if keys is None or (
@@ -2140,7 +2178,12 @@ class WindowsControlExecutor:
         if self.native_backend is None:
             return self._native_unavailable(request)
         try:
-            outcome = self.native_backend.send_hotkey(keys, expected_gate_token)
+            if input_guard is None:
+                outcome = self.native_backend.send_hotkey(keys, expected_gate_token)
+            else:
+                outcome = self.native_backend.send_hotkey(
+                    keys, expected_gate_token, input_guard
+                )
         except Exception:
             outcome = BackendActionResult.failed("native")
         return self._from_backend(request.intent, outcome, target_id)
@@ -2187,7 +2230,11 @@ class WindowsControlExecutor:
         return self.execute(request, confirmed=confirmed)
 
     def execute(
-        self, request: ControlRequest, *, confirmed: bool = False
+        self,
+        request: ControlRequest,
+        *,
+        confirmed: bool = False,
+        input_guard: Callable[[], bool] | None = None,
     ) -> ControlResult:
         try:
             intent = CanonicalIntent(request.intent)
@@ -2275,7 +2322,7 @@ class WindowsControlExecutor:
         if intent is CanonicalIntent.INVOKE_NUMBERED_ELEMENT:
             return self._execute_numbered_element(request, context)
         if intent is CanonicalIntent.SEND_KEY:
-            return self._execute_key(request, context)
+            return self._execute_key(request, context, input_guard)
         if intent is CanonicalIntent.SEND_HOTKEY:
-            return self._execute_hotkey(request, context)
+            return self._execute_hotkey(request, context, input_guard)
         return self._result(ResultStatus.REJECTED, intent, reason="unsupported_intent")

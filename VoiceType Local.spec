@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import copy_metadata
 
 datas = [('models\\small', 'models\\small'), ('assets\\packs', 'assets\\packs')]
 binaries = []
-hiddenimports = ['pystray._win32', 'pynput.keyboard._win32', 'voicetype_local.packaged_self_test', 'voicetype_local.windows_control', 'voicetype_local.voice_control', 'voicetype_local.voice_commands', 'voicetype_local.dictation_transform', 'voicetype_local.session_editing', 'voicetype_local.session_editor', 'voicetype_local.windows_session_editor_probe']
+hiddenimports = ['pystray._win32', 'pynput.keyboard._win32', 'voicetype_local.packaged_self_test', 'voicetype_local.windows_control', 'voicetype_local.voice_control', 'voicetype_local.voice_commands', 'voicetype_local.dictation_transform', 'voicetype_local.session_editing', 'voicetype_local.session_editor', 'voicetype_local.targeted_inserter', 'voicetype_local.test_lab', 'voicetype_local.windows_session_editor_probe', 'voicetype_local.windows_targeted_inserter_probe']
 datas += copy_metadata('uiautomation')
 tmp_ret = collect_all('faster_whisper')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

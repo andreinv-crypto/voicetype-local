@@ -44,9 +44,16 @@ data only.
   bypasses.
 - Sensitive and destructive UI actions require a short-lived confirmation bound
   to the exact typed request. A stale or different confirmation fails closed.
-- UI Automation snapshots contain immutable metadata only. Live COM controls
-  stay inside their initialized worker thread; numbered invocation must
-  re-enumerate and verify foreground window, identity, role, name and bounds.
+- Numbered-control UI Automation snapshots contain immutable metadata only.
+  Live COM controls stay inside their initialized worker thread; numbered
+  invocation must re-enumerate and verify foreground window, identity, role,
+  name and bounds.
+- Exact Unicode insertion and VoiceType-owned editing in modern Windows 11
+  Notepad may additionally hold a bounded snapshot of up to 65,536 UTF-16 code
+  units from the focused document in RAM (with one extra unit requested only
+  to detect overflow). It is used only for the adjacent
+  pre/postcondition, never logged, persisted, hashed or transmitted, and the
+  operation fails closed when the bound or identity proof is unavailable.
 - Command diagnostics may contain intent/result/backend/duration only; spoken
   text, accessible names, window titles, paths and document content are banned.
 

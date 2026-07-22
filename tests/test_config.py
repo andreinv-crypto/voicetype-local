@@ -42,7 +42,7 @@ def test_dictation_feature_booleans_fail_closed_to_their_defaults() -> None:
 
     assert settings.dictation_commands_enabled is True
     assert settings.remove_fillers is False
-    assert settings.automatic_spacing is False
+    assert settings.automatic_spacing is True
 
 
 def test_existing_settings_file_migrates_dictation_defaults(tmp_path) -> None:
@@ -54,6 +54,15 @@ def test_existing_settings_file_migrates_dictation_defaults(tmp_path) -> None:
     assert settings.language == "ru"
     assert settings.dictation_commands_enabled is True
     assert settings.remove_fillers is False
+    assert settings.automatic_spacing is True
+
+
+def test_explicit_automatic_spacing_opt_out_is_preserved(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text('{"automatic_spacing":false}\n', encoding="utf-8")
+
+    settings = SettingsStore(path).get()
+
     assert settings.automatic_spacing is False
 
 

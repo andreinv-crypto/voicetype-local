@@ -68,6 +68,110 @@ def test_inserter_marks_partial_sendinput_as_unsafe_to_retry() -> None:
     assert captured.value.partial is True
 
 
+def test_atomic_inserter_sends_long_unicode_in_one_native_call() -> None:
+    inserter = UnicodeTextInserter(chunk_size=1)
+    raw = (("😀 Привет\r\nline\t" * 300) + "конец")
+    normalized = raw.replace("\r\n", "\n")
+    calls: list[list[tuple[int, int, int]]] = []
+    order: list[str] = []
+
+    def before_batch() -> bool:
+        order.append("guard")
+        return True
+
+    def send_input(count, events, _size):
+        order.append("native")
+        calls.append(
+            [
+                (events[index].ki.wVk, events[index].ki.wScan, events[index].ki.dwFlags)
+                for index in range(count)
+            ]
+        )
+        return count
+
+    inserter._send_input = send_input  # type: ignore[method-assign]
+
+    inserter.insert_atomic(raw, before_batch=before_batch)
+
+    expected_units = [
+        unit
+        for character in normalized
+        for unit in _unicode_units(character)
+    ]
+    assert order == ["guard", "native"]
+    assert len(calls) == 1
+    assert len(calls[0]) == len(expected_units) * 2
+    assert [event[1] for event in calls[0][::2]] == expected_units
+    assert all(event[0] == 0 for event in calls[0])
+    assert all(event[2] & KEYEVENTF_UNICODE for event in calls[0])
+    assert all(not event[2] & KEYEVENTF_KEYUP for event in calls[0][::2])
+    assert all(event[2] & KEYEVENTF_KEYUP for event in calls[0][1::2])
+
+
+def test_atomic_inserter_guard_rejection_prevents_native_side_effect() -> None:
+    inserter = UnicodeTextInserter(chunk_size=1)
+    order: list[str] = []
+
+    def reject() -> bool:
+        order.append("guard")
+        return False
+
+    def send_input(_count, _events, _size):
+        order.append("native")
+        raise AssertionError("native SendInput must not run after guard rejection")
+
+    inserter._send_input = send_input  # type: ignore[method-assign]
+
+    with pytest.raises(TextInsertionError) as captured:
+        inserter.insert_atomic("текст", before_batch=reject)
+
+    assert captured.value.reason_code == "input_guard_rejected"
+    assert captured.value.partial is False
+    assert order == ["guard"]
+
+
+@pytest.mark.parametrize(
+    ("sent_events", "expected_partial"),
+    [(0, False), (1, True)],
+)
+def test_atomic_inserter_preserves_zero_and_partial_sendinput_contracts(
+    sent_events: int,
+    expected_partial: bool,
+) -> None:
+    inserter = UnicodeTextInserter(chunk_size=1)
+    calls = 0
+
+    def send_input(_count, _events, _size):
+        nonlocal calls
+        calls += 1
+        return sent_events
+
+    inserter._send_input = send_input  # type: ignore[method-assign]
+
+    with pytest.raises(TextInsertionError) as captured:
+        inserter.insert_atomic("ab", before_batch=lambda: True)
+
+    assert calls == 1
+    assert captured.value.partial is expected_partial
+
+
+def test_atomic_inserter_validates_before_guard_or_native_boundary() -> None:
+    inserter = UnicodeTextInserter()
+    order: list[str] = []
+    inserter._send_input = (  # type: ignore[method-assign]
+        lambda _count, _events, _size: order.append("native") or 0
+    )
+
+    with pytest.raises(TextInsertionError) as captured:
+        inserter.insert_atomic(
+            "unsafe\x00text",
+            before_batch=lambda: order.append("guard") or True,
+        )
+
+    assert captured.value.partial is False
+    assert order == []
+
+
 def test_empty_selection_replacement_emits_one_backspace_pair() -> None:
     inserter = UnicodeTextInserter()
     sent: list[list[INPUT]] = []

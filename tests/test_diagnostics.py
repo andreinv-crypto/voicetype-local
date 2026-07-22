@@ -70,6 +70,23 @@ def test_voice_command_logs_accept_metadata_but_never_spoken_text(tmp_path) -> N
     assert "Личный документ" not in content
 
 
+def test_text_insertion_failure_keeps_its_allowlisted_event_name(tmp_path) -> None:
+    path = tmp_path / "voice.log"
+    logger = TechnicalLogger(path)
+    logger.event(
+        "text_insertion_failed",
+        operation="richedit_targeted",
+        code="targeted_insert_timeout",
+        transcript="секретный текст",
+    )
+    logger.close()
+
+    content = path.read_text(encoding="utf-8")
+    assert '"event":"text_insertion_failed"' in content
+    assert "targeted_insert_timeout" in content
+    assert "секретный текст" not in content
+
+
 def test_dictation_transform_logs_only_bounded_metadata(tmp_path) -> None:
     path = tmp_path / "voice.log"
     logger = TechnicalLogger(path)

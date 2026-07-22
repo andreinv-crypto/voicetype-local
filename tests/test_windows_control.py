@@ -77,18 +77,32 @@ class _Native:
         return self.outcome
 
     def send_key(
-        self, key: str, expected_gate_token: str | None = None
+        self,
+        key: str,
+        expected_gate_token: str | None = None,
+        input_guard=None,
     ) -> BackendActionResult:
         if expected_gate_token is not None and expected_gate_token != self.gate_token:
             return BackendActionResult.blocked("fake_native", "foreground_changed")
+        if input_guard is not None and not input_guard():
+            return BackendActionResult.blocked(
+                "fake_native", "input_guard_rejected"
+            )
         self.calls.append(("key", key))
         return self.outcome
 
     def send_hotkey(
-        self, keys: tuple[str, ...], expected_gate_token: str | None = None
+        self,
+        keys: tuple[str, ...],
+        expected_gate_token: str | None = None,
+        input_guard=None,
     ) -> BackendActionResult:
         if expected_gate_token is not None and expected_gate_token != self.gate_token:
             return BackendActionResult.blocked("fake_native", "foreground_changed")
+        if input_guard is not None and not input_guard():
+            return BackendActionResult.blocked(
+                "fake_native", "input_guard_rejected"
+            )
         self.calls.append(("hotkey", keys))
         return self.outcome
 
@@ -837,6 +851,79 @@ def test_elevated_controller_fails_closed_before_touching_target_window() -> Non
     assert blocked.reason_code == "controller_elevated_or_unknown"
 
 
+def test_native_input_guard_runs_immediately_before_sendinput() -> None:
+    events: list[str] = []
+
+    class _User32:
+        @staticmethod
+        def SendInput(count, _inputs, _size):
+            events.append("sendinput")
+            return count
+
+    backend = windows_control.Win32ControlBackend.__new__(
+        windows_control.Win32ControlBackend
+    )
+    backend._user32 = _User32()
+
+    def guard() -> bool:
+        events.append("guard")
+        return True
+
+    result = backend._send((windows_control._INPUT(),), guard)
+
+    assert result.status is BackendStatus.SUCCESS
+    assert events == ["guard", "sendinput"]
+
+
+@pytest.mark.parametrize("raises", (False, True))
+def test_native_input_guard_blocks_without_sendinput(raises: bool) -> None:
+    sendinput_calls: list[int] = []
+
+    class _User32:
+        @staticmethod
+        def SendInput(count, _inputs, _size):
+            sendinput_calls.append(count)
+            return count
+
+    backend = windows_control.Win32ControlBackend.__new__(
+        windows_control.Win32ControlBackend
+    )
+    backend._user32 = _User32()
+
+    def guard() -> bool:
+        if raises:
+            raise RuntimeError("focus probe failed")
+        return False
+
+    result = backend._send((windows_control._INPUT(),), guard)
+
+    assert result.status is BackendStatus.BLOCKED
+    assert result.reason_code == (
+        "input_guard_failed" if raises else "input_guard_rejected"
+    )
+    assert sendinput_calls == []
+
+
+@pytest.mark.parametrize(
+    "control_request",
+    (
+        ControlRequest(CanonicalIntent.SEND_KEY, key="down"),
+        ControlRequest(CanonicalIntent.SEND_HOTKEY, keys=("ctrl", "c")),
+    ),
+)
+def test_executor_maps_native_input_guard_rejection_without_action(
+    control_request: ControlRequest,
+) -> None:
+    native = _Native()
+    executor = _executor(native=native)
+
+    result = executor.execute(control_request, input_guard=lambda: False)
+
+    assert result.status is ResultStatus.REJECTED
+    assert result.reason_code == "input_guard_rejected"
+    assert native.calls == []
+
+
 def test_result_is_metadata_only() -> None:
     native = _Native()
     executor = _executor(native=native)
@@ -907,6 +994,7 @@ def test_uia_bounds_accepts_property_only_rectangle_wrapper() -> None:
 
 def test_public_confirmation_flags_are_opt_in() -> None:
     assert signature(WindowsControlExecutor.execute).parameters["confirmed"].default is False
+    assert signature(WindowsControlExecutor.execute).parameters["input_guard"].default is None
     assert (
         signature(WindowsControlExecutor.execute_action)
         .parameters["confirmed"]

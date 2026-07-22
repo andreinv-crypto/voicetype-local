@@ -9,7 +9,7 @@ In the default configuration:
 - the resulting transcript is kept in memory only for insertion/retry;
 - audio and transcripts are not written to diagnostics;
 - no field values, screenshots, clipboard history, document bodies or
-  background edits are deliberately collected;
+  background edits are stored, logged, transmitted or added to history;
 - voice-command source text is not added to session transcript memory or
   diagnostics;
 - the local memory database stores terms/preferences explicitly added or
@@ -26,6 +26,16 @@ bounded accessible element name, control role, enabled/off-screen state,
 geometry and opaque runtime identifier. It does not request field values,
 document text, passwords, screenshots or clipboard contents.
 
+There is one narrow local exception for modern Windows 11 Notepad. To insert
+Unicode text reliably and to verify VoiceType's own edit, VoiceType temporarily
+reads a bounded prefix from the focused Notepad document into RAM. It accepts
+and keeps a snapshot of at most 65,536 UTF-16 code units; one extra unit may be
+requested only to detect overflow. The text is used only for the current
+insertion/edit check, is never
+logged, stored, hashed or sent over the network, and is released when the check
+finishes. The operation refuses to run when the document exceeds that bound or
+the exact snapshot cannot be proven. Password fields are always refused.
+
 An accessible `Name` is supplied by the active application and can itself be a
 visible label, link text, contact name or document-related title. VoiceType
 keeps it only in the bounded temporary snapshot needed for the explicit Control
@@ -41,6 +51,20 @@ title or field content.
 The application does not contain a persistent dictation-history feed. Raw,
 dictionary-normalized and corrected text from the current session can be
 copied or cleared by the user and is released on exit.
+
+## Quick Test Lab
+
+The Quick Test Lab, opened from Settings, uses one VoiceType-owned text field
+for three guided voice steps: dictation, delete the last sentence, and restore
+the edit. During this smoke test, recognition and correction are forced to the
+local Whisper and local correction paths; optional cloud providers are not
+called.
+
+Test text and step results exist only in RAM. They are not added to history or
+technical logs. The optional copied summary contains no transcript and reaches
+the clipboard only after an explicit user action. Closing or restarting the
+lab clears its session-only text. The lab is a quick local smoke test, not a
+substitute for selective checks in real applications.
 
 ## Optional cloud text correction
 

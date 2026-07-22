@@ -22,6 +22,12 @@ from typing import Callable, Protocol, cast
 from .focus import FocusInspector, FocusMatch, FocusTarget
 from .inserter import TextInsertionError, UnicodeTextInserter
 from .session_editing import MAX_TRACKED_INSERTION_CHARS, SessionEditPlan
+from .targeted_inserter import (
+    RICHEDIT_D2DPT_CLASS,
+    TargetedInsertionResult,
+    TargetedInsertionStatus,
+    TargetedRichEditInserter,
+)
 
 
 class SessionEditorStatus(StrEnum):
@@ -58,6 +64,24 @@ class _DeletionAnchor:
     insertion_start: object
 
 
+@dataclass(frozen=True, slots=True)
+class _TargetedDocumentSnapshot:
+    prefix_text: str
+    suffix_text: str
+    selection: object
+
+
+@dataclass(frozen=True, slots=True)
+class _InsertionBaseline:
+    """Ephemeral, bounded proof of the insertion point before SendInput."""
+
+    selection: object
+    insertion_start: object
+    selection_was_collapsed: bool
+    prefix_text: str
+    suffix_text: str
+
+
 class _SelectionInserter(Protocol):
     def replace_selection(self, text: str) -> None: ...
 
@@ -67,6 +91,14 @@ _UIA_POLL_INTERVAL_SECONDS = 0.02
 _UIA_SELECTION_VERIFY_ATTEMPTS = 25
 _UIA_SELECTION_REQUEST_ATTEMPTS = 2
 _UIA_POST_EDIT_VERIFY_ATTEMPTS = 25
+_TARGETED_DOCUMENT_MAX_UTF16_UNITS = 65_536
+_TARGETED_BACKEND = "uia_text+richedit_targeted"
+_INSERTION_VERIFY_BACKEND = "uia_text_postcheck"
+_VERIFIED_INSERTION_BACKEND = "uia_text_delta+sendinput_unicode"
+_GUARDED_UNVERIFIED_INSERTION_BACKEND = (
+    "uia_focus+sendinput_unicode:guarded_unverified"
+)
+_INSERTION_BASELINE_CONTEXT_UNITS = 128
 
 
 def _optional_automation() -> object | None:
@@ -114,8 +146,10 @@ class SessionTextEditor:
         inserter: _SelectionInserter | None = None,
         focus_inspector: FocusInspector | None = None,
         automation_module: object | None | object = _AUTO_AUTOMATION,
+        targeted_inserter: TargetedRichEditInserter | None = None,
     ) -> None:
         self.inserter = inserter or UnicodeTextInserter()
+        self.targeted_inserter = targeted_inserter
         self.focus_inspector = focus_inspector or FocusInspector()
         self.automation = (
             _optional_automation()
@@ -384,9 +418,14 @@ class SessionTextEditor:
             if not callable(move_start):
                 self._match_diagnostic = "move_unavailable"
                 return None, "text_range_unavailable"
+            crlf_expected = expected_text.replace("\n", "\r\n")
             lookup_units = min(
                 MAX_TRACKED_INSERTION_CHARS * 2,
-                max(64, len(expected_text.encode("utf-16-le")) // 2 + 16),
+                max(
+                    64,
+                    len(expected_text.encode("utf-16-le")) // 2 + 16,
+                    len(crlf_expected.encode("utf-16-le")) // 2 + 16,
+                ),
             )
             move_start(start_endpoint, character_unit, -lookup_units, waitTime=0)
             find_text = getattr(lookback, "FindText", None)
@@ -394,7 +433,7 @@ class SessionTextEditor:
                 self._match_diagnostic = "find_unavailable"
                 return None, "text_range_unavailable"
             variants = [expected_text]
-            crlf = expected_text.replace("\n", "\r\n")
+            crlf = crlf_expected
             if crlf != expected_text:
                 variants.append(crlf)
             found = None
@@ -849,6 +888,422 @@ class SessionTextEditor:
         except Exception:
             return False
 
+    def _selection_endpoints_match(self, left: object, right: object) -> bool:
+        """Compare a selection without reading its potentially large text."""
+
+        if self.automation is None:
+            return False
+        start_endpoint, end_endpoint, _unit = self._endpoints(self.automation)
+        try:
+            return bool(
+                self._text_equivalent_endpoints(
+                    left,
+                    start_endpoint,
+                    right,
+                    start_endpoint,
+                )
+                and self._text_equivalent_endpoints(
+                    left,
+                    end_endpoint,
+                    right,
+                    end_endpoint,
+                )
+            )
+        except Exception:
+            return False
+
+    def _bounded_text_before(self, text_range: object) -> str | None:
+        """Read a small local prefix ending at ``text_range``'s start."""
+
+        if self.automation is None:
+            return None
+        start_endpoint, end_endpoint, character_unit = self._endpoints(
+            self.automation
+        )
+        clone = getattr(text_range, "Clone", None)
+        local = clone() if callable(clone) else None
+        collapse = getattr(local, "MoveEndpointByRange", None)
+        move = getattr(local, "MoveEndpointByUnit", None)
+        if local is None or not callable(collapse) or not callable(move):
+            return None
+        try:
+            if not bool(
+                collapse(
+                    end_endpoint,
+                    text_range,
+                    start_endpoint,
+                    waitTime=0,
+                )
+            ):
+                return None
+            move(
+                start_endpoint,
+                character_unit,
+                -_INSERTION_BASELINE_CONTEXT_UNITS,
+                waitTime=0,
+            )
+            return self._range_text(local)
+        except Exception:
+            return None
+
+    def _bounded_text_after(self, text_range: object) -> str | None:
+        """Read a small local suffix beginning at ``text_range``'s end."""
+
+        if self.automation is None:
+            return None
+        start_endpoint, end_endpoint, character_unit = self._endpoints(
+            self.automation
+        )
+        clone = getattr(text_range, "Clone", None)
+        local = clone() if callable(clone) else None
+        collapse = getattr(local, "MoveEndpointByRange", None)
+        move = getattr(local, "MoveEndpointByUnit", None)
+        if local is None or not callable(collapse) or not callable(move):
+            return None
+        try:
+            if not bool(
+                collapse(
+                    start_endpoint,
+                    text_range,
+                    end_endpoint,
+                    waitTime=0,
+                )
+            ):
+                return None
+            move(
+                end_endpoint,
+                character_unit,
+                _INSERTION_BASELINE_CONTEXT_UNITS,
+                waitTime=0,
+            )
+            return self._range_text(local)
+        except Exception:
+            return None
+
+    def _insertion_baseline(
+        self,
+        pattern: object,
+    ) -> tuple[_InsertionBaseline | None, str]:
+        """Capture only local context and range anchors around one selection."""
+
+        if self.automation is None:
+            return None, "uia_unavailable"
+        selections = self._selection(pattern)
+        if len(selections) != 1:
+            return None, "selection_unavailable"
+        current = selections[0]
+        start_endpoint, end_endpoint, _unit = self._endpoints(self.automation)
+        clone = getattr(current, "Clone", None)
+        if not callable(clone):
+            return None, "selection_unavailable"
+        try:
+            direction = self._compare_endpoints(
+                current,
+                start_endpoint,
+                current,
+                end_endpoint,
+            )
+            if direction > 0:
+                return None, "selection_unavailable"
+            selection = clone()
+            insertion_start = clone()
+            collapse_start = getattr(
+                insertion_start,
+                "MoveEndpointByRange",
+                None,
+            )
+            if selection is None or insertion_start is None or not callable(
+                collapse_start
+            ):
+                return None, "selection_unavailable"
+            if not bool(
+                collapse_start(
+                    end_endpoint,
+                    current,
+                    start_endpoint,
+                    waitTime=0,
+                )
+            ):
+                return None, "selection_unavailable"
+            prefix_text = self._bounded_text_before(current)
+            suffix_text = self._bounded_text_after(current)
+            if prefix_text is None or suffix_text is None:
+                return None, "text_range_unavailable"
+            return (
+                _InsertionBaseline(
+                    selection=selection,
+                    insertion_start=insertion_start,
+                    selection_was_collapsed=(direction == 0),
+                    prefix_text=prefix_text,
+                    suffix_text=suffix_text,
+                ),
+                "ok",
+            )
+        except Exception:
+            return None, "selection_unavailable"
+
+    def _insertion_delta_matches(
+        self,
+        pattern: object,
+        inserted_range: object,
+        baseline: _InsertionBaseline,
+    ) -> bool:
+        """Prove the exact local pre/post transition, not merely a suffix."""
+
+        if self.automation is None:
+            return False
+        selections = self._selection(pattern)
+        if len(selections) != 1:
+            return False
+        caret = selections[0]
+        start_endpoint, end_endpoint, _unit = self._endpoints(self.automation)
+        try:
+            if (
+                self._compare_endpoints(
+                    caret,
+                    start_endpoint,
+                    caret,
+                    end_endpoint,
+                )
+                != 0
+            ):
+                return False
+            if not self._text_equivalent_endpoints(
+                inserted_range,
+                end_endpoint,
+                caret,
+                start_endpoint,
+            ):
+                return False
+            # This is the critical no-op/duplicate-suffix defence: the exact
+            # inserted suffix must begin at the selection start captured
+            # before SendInput.  A pre-existing identical suffix begins before
+            # the old caret and therefore cannot satisfy this proof.
+            if not self._text_equivalent_endpoints(
+                inserted_range,
+                start_endpoint,
+                baseline.insertion_start,
+                start_endpoint,
+            ):
+                return False
+            prefix_text = self._bounded_text_before(inserted_range)
+            suffix_text = self._bounded_text_after(caret)
+            if prefix_text is None or suffix_text is None:
+                return False
+            if (
+                prefix_text != baseline.prefix_text
+                or suffix_text != baseline.suffix_text
+            ):
+                return False
+            if baseline.selection_was_collapsed:
+                # A non-empty exact range beginning at the old collapsed caret
+                # is itself the state delta.  The endpoint check above keeps an
+                # identical old suffix from being mistaken for that range.
+                return not self._text_equivalent_endpoints(
+                    inserted_range,
+                    start_endpoint,
+                    caret,
+                    start_endpoint,
+                )
+            # For replacement, the old non-collapsed selection becoming this
+            # exact suffix plus a collapsed caret is the demonstrable delta.
+            return not self._selection_endpoints_match(
+                caret,
+                baseline.selection,
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _utf16_units(value: str) -> int:
+        """Return the Windows/COM UTF-16 code-unit length of ``value``."""
+
+        return len(value.encode("utf-16-le", errors="surrogatepass")) // 2
+
+    @staticmethod
+    def _targeted_bounded_range_text(text_range: object) -> tuple[str | None, str]:
+        """Read at most one UTF-16 unit beyond the targeted Notepad limit."""
+
+        getter = getattr(text_range, "GetText", None)
+        if not callable(getter):
+            return None, "document_range_unavailable"
+        try:
+            value = getter(_TARGETED_DOCUMENT_MAX_UTF16_UNITS + 1)
+            raw = "" if value is None else str(value)
+        except Exception:
+            return None, "document_range_unavailable"
+        if (
+            SessionTextEditor._utf16_units(raw)
+            > _TARGETED_DOCUMENT_MAX_UTF16_UNITS
+        ):
+            return None, "document_too_large"
+        return _provider_text(raw), "ok"
+
+    def _targeted_document_snapshot(
+        self,
+        pattern: object,
+    ) -> tuple[_TargetedDocumentSnapshot | None, str]:
+        """Capture one bounded full-document replacement snapshot.
+
+        The returned strings live only on this call stack.  No text, hash or
+        range contents are written to diagnostics or retained by the editor.
+        """
+
+        if self.automation is None:
+            return None, "uia_unavailable"
+        selections = self._selection(pattern)
+        if len(selections) != 1:
+            return None, "selection_unavailable"
+        selection = selections[0]
+        document_range = getattr(pattern, "DocumentRange", None)
+        if document_range is None:
+            return None, "document_range_unavailable"
+        document_text, reason = self._targeted_bounded_range_text(document_range)
+        if document_text is None:
+            return None, reason
+
+        start_endpoint, end_endpoint, _unit = self._endpoints(self.automation)
+        clone_document = getattr(document_range, "Clone", None)
+        clone_selection = getattr(selection, "Clone", None)
+        if not callable(clone_document) or not callable(clone_selection):
+            return None, "document_range_unavailable"
+        try:
+            if (
+                self._compare_endpoints(
+                    selection,
+                    start_endpoint,
+                    document_range,
+                    start_endpoint,
+                )
+                < 0
+                or self._compare_endpoints(
+                    selection,
+                    end_endpoint,
+                    document_range,
+                    end_endpoint,
+                )
+                > 0
+                or self._compare_endpoints(
+                    selection,
+                    start_endpoint,
+                    selection,
+                    end_endpoint,
+                )
+                > 0
+            ):
+                return None, "selection_unavailable"
+
+            prefix_range = clone_document()
+            suffix_range = clone_document()
+            expected_selection = clone_selection()
+            prefix_move = getattr(prefix_range, "MoveEndpointByRange", None)
+            suffix_move = getattr(suffix_range, "MoveEndpointByRange", None)
+            if (
+                prefix_range is None
+                or suffix_range is None
+                or expected_selection is None
+                or not callable(prefix_move)
+                or not callable(suffix_move)
+            ):
+                return None, "document_range_unavailable"
+            if not bool(
+                prefix_move(
+                    end_endpoint,
+                    selection,
+                    start_endpoint,
+                    waitTime=0,
+                )
+            ) or not bool(
+                suffix_move(
+                    start_endpoint,
+                    selection,
+                    end_endpoint,
+                    waitTime=0,
+                )
+            ):
+                return None, "document_range_unavailable"
+
+            prefix_text, prefix_reason = self._targeted_bounded_range_text(
+                prefix_range
+            )
+            selected_text, selected_reason = self._targeted_bounded_range_text(
+                selection
+            )
+            suffix_text, suffix_reason = self._targeted_bounded_range_text(
+                suffix_range
+            )
+            if prefix_text is None or selected_text is None or suffix_text is None:
+                reasons = (prefix_reason, selected_reason, suffix_reason)
+                return None, (
+                    "document_too_large"
+                    if "document_too_large" in reasons
+                    else "document_range_unavailable"
+                )
+            if prefix_text + selected_text + suffix_text != document_text:
+                return None, "document_snapshot_mismatch"
+            return (
+                _TargetedDocumentSnapshot(
+                    prefix_text,
+                    suffix_text,
+                    expected_selection,
+                ),
+                "ok",
+            )
+        except Exception:
+            return None, "document_range_unavailable"
+
+    def _targeted_result_matches(
+        self,
+        pattern: object,
+        expected_text: str,
+        expected_caret_prefix: str,
+    ) -> bool:
+        if self.automation is None:
+            return False
+        try:
+            document_range = getattr(pattern, "DocumentRange", None)
+            if document_range is None:
+                return False
+            actual, _reason = self._targeted_bounded_range_text(document_range)
+            if actual is None or actual != expected_text:
+                return False
+            selections = self._selection(pattern)
+            if len(selections) != 1:
+                return False
+            caret = selections[0]
+            start_endpoint, end_endpoint, _unit = self._endpoints(self.automation)
+            if (
+                self._compare_endpoints(
+                    caret,
+                    start_endpoint,
+                    caret,
+                    end_endpoint,
+                )
+                != 0
+            ):
+                return False
+            clone = getattr(document_range, "Clone", None)
+            prefix_range = clone() if callable(clone) else None
+            move = getattr(prefix_range, "MoveEndpointByRange", None)
+            if prefix_range is None or not callable(move):
+                return False
+            if not bool(
+                move(
+                    end_endpoint,
+                    caret,
+                    start_endpoint,
+                    waitTime=0,
+                )
+            ):
+                return False
+            prefix_text, _reason = self._targeted_bounded_range_text(prefix_range)
+            return (
+                prefix_text is not None
+                and prefix_text == expected_caret_prefix
+            )
+        except Exception:
+            return False
+
     def _move_caret_to_result_end(
         self,
         pattern: object,
@@ -1111,9 +1566,17 @@ class SessionTextEditor:
 
                 input_guard_reason = "focus_changed_after_selection"
                 first_input_batch = True
+                use_targeted_input = bool(
+                    self.targeted_inserter is not None
+                    and expected_target.focused_class_name
+                    == RICHEDIT_D2DPT_CLASS
+                )
+                input_backend = (
+                    "richedit_targeted" if use_targeted_input else "sendinput_unicode"
+                )
 
                 def before_input_batch() -> bool:
-                    """Re-authorize the target immediately before every SendInput."""
+                    """Re-authorize the exact selection before native input."""
 
                     nonlocal first_input_batch, input_guard_reason
                     if not is_current():
@@ -1131,8 +1594,8 @@ class SessionTextEditor:
                             input_guard_reason = "selection_changed"
                             return False
                         first_input_batch = False
-                    # Keep the focus proof last: UnicodeTextInserter invokes
-                    # this guard immediately before the native SendInput call.
+                    # Keep the focus proof last.  Both inserters invoke this
+                    # guard immediately before their bounded native call.
                     if (
                         not is_current()
                         or self.focus_inspector.compare_current(expected_target)
@@ -1143,26 +1606,96 @@ class SessionTextEditor:
                     return True
 
                 try:
-                    guarded_replace = getattr(
-                        self.inserter,
-                        "replace_selection_guarded",
-                        None,
-                    )
-                    if callable(guarded_replace):
-                        guarded_replace(
-                            plan.replacement_text,
-                            before_batch=before_input_batch,
-                        )
-                    else:
-                        # Non-SendInput test/target-bound backends perform one
-                        # operation, so one immediately adjacent proof suffices.
-                        if not before_input_batch():
+                    if use_targeted_input:
+                        assert self.targeted_inserter is not None
+                        try:
+                            targeted_result = self.targeted_inserter.insert(
+                                plan.replacement_text,
+                                hwnd=expected_target.focused_hwnd,
+                                class_name=expected_target.focused_class_name,
+                                before_call=before_input_batch,
+                            )
+                        except Exception:
+                            return SessionEditorResult(
+                                SessionEditorStatus.UNCERTAIN,
+                                "edit_result_unknown",
+                                backend=input_backend,
+                            )
+                        if not isinstance(
+                            targeted_result,
+                            TargetedInsertionResult,
+                        ):
+                            return SessionEditorResult(
+                                SessionEditorStatus.UNCERTAIN,
+                                "edit_result_unknown",
+                                backend=input_backend,
+                            )
+                        if (
+                            targeted_result.status
+                            is TargetedInsertionStatus.ACCEPTED
+                        ):
+                            pass
+                        elif (
+                            targeted_result.status
+                            is TargetedInsertionStatus.REJECTED
+                            and not targeted_result.postcheck_required
+                            and targeted_result.safe_to_retry
+                            and targeted_result.reason_code
+                            in {"guard_rejected", "guard_error"}
+                        ):
                             raise TextInsertionError(
                                 "Input target changed before replacement",
                                 partial=False,
                                 reason_code="input_guard_rejected",
                             )
-                        self.inserter.replace_selection(plan.replacement_text)
+                        elif (
+                            targeted_result.status
+                            is TargetedInsertionStatus.REJECTED
+                            and not targeted_result.postcheck_required
+                            and targeted_result.safe_to_retry
+                        ):
+                            restored = self._restore_caret(restore_caret)
+                            return SessionEditorResult(
+                                SessionEditorStatus.UNAVAILABLE
+                                if restored
+                                else SessionEditorStatus.UNCERTAIN,
+                                targeted_result.reason_code
+                                if restored
+                                else "selection_restore_failed",
+                                backend=input_backend,
+                            )
+                        else:
+                            # TIMEOUT, an unsafe native rejection and an
+                            # unknown status may all have changed the document.
+                            # Never fall back to SendInput or retry blindly.
+                            return SessionEditorResult(
+                                SessionEditorStatus.UNCERTAIN,
+                                "edit_result_unknown",
+                                backend=input_backend,
+                            )
+                    else:
+                        guarded_replace = getattr(
+                            self.inserter,
+                            "replace_selection_guarded",
+                            None,
+                        )
+                        if callable(guarded_replace):
+                            guarded_replace(
+                                plan.replacement_text,
+                                before_batch=before_input_batch,
+                            )
+                        else:
+                            # Non-SendInput test/target-bound backends perform
+                            # one operation, so one adjacent proof suffices.
+                            if not before_input_batch():
+                                raise TextInsertionError(
+                                    "Input target changed before replacement",
+                                    partial=False,
+                                    reason_code="input_guard_rejected",
+                                )
+                            self.inserter.replace_selection(
+                                plan.replacement_text
+                            )
                 except TextInsertionError as exc:
                     if (
                         exc.reason_code == "input_guard_rejected"
@@ -1176,7 +1709,7 @@ class SessionTextEditor:
                             input_guard_reason
                             if restored
                             else "selection_restore_failed",
-                            backend="sendinput_unicode",
+                            backend=input_backend,
                         )
                     restored = False
                     if not exc.partial:
@@ -1192,13 +1725,13 @@ class SessionTextEditor:
                             if restored
                             else "selection_restore_failed"
                         ),
-                        backend="sendinput_unicode",
+                        backend=input_backend,
                     )
                 except Exception:
                     return SessionEditorResult(
                         SessionEditorStatus.UNCERTAIN,
                         "edit_result_unknown",
-                        backend="sendinput_unicode",
+                        backend=input_backend,
                     )
 
                 if plan.end < len(plan.original_text):
@@ -1218,10 +1751,10 @@ class SessionTextEditor:
                         return SessionEditorResult(
                             SessionEditorStatus.UNCERTAIN,
                             "edit_caret_restore_failed",
-                            backend="sendinput_unicode",
+                            backend=input_backend,
                         )
 
-                # UIA providers can update one event-loop tick after SendInput.
+                # UIA providers can update one event-loop tick after native input.
                 # Verification is bounded and keeps no document text.
                 verified = False
                 for attempt in range(_UIA_POST_EDIT_VERIFY_ATTEMPTS):
@@ -1270,7 +1803,15 @@ class SessionTextEditor:
                     return SessionEditorResult(
                         SessionEditorStatus.UNCERTAIN,
                         "edit_verification_failed",
-                        backend=f"uia_text_{proof_mode}:postcheck_{diagnostic}",
+                        backend=(
+                            f"uia_text_{proof_mode}:postcheck_{diagnostic}"
+                            if not use_targeted_input
+                            else (
+                                "uia_text_"
+                                f"{proof_mode}+richedit_targeted:"
+                                f"postcheck_{diagnostic}"
+                            )
+                        ),
                     )
                 empty_document_verified = False
                 empty_capability_candidate = bool(
@@ -1301,13 +1842,13 @@ class SessionTextEditor:
                     SessionEditorStatus.EXECUTED,
                     "ok",
                     backend=(
-                        "uia_text_owned_empty_document+sendinput_unicode"
+                        f"uia_text_owned_empty_document+{input_backend}"
                         if used_owned_empty_document
-                        else "uia_text_owned_document+sendinput_unicode"
+                        else f"uia_text_owned_document+{input_backend}"
                         if used_owned_document
-                        else "uia_text_endpoint_equivalent+sendinput_unicode"
+                        else f"uia_text_endpoint_equivalent+{input_backend}"
                         if used_endpoint_equivalent
-                        else "uia_text+sendinput_unicode"
+                        else f"uia_text+{input_backend}"
                     ),
                     empty_document_verified=empty_document_verified,
                 )
@@ -1319,6 +1860,824 @@ class SessionTextEditor:
                 SessionEditorStatus.UNCERTAIN,
                 "edit_result_unknown",
             )
+
+    def _insert_targeted_once(
+        self,
+        text: str,
+        expected_target: FocusTarget,
+        targeted_inserter: TargetedRichEditInserter,
+        *,
+        is_current: Callable[[], bool] = lambda: True,
+    ) -> SessionEditorResult:
+        """Insert through the exact Windows 11 Notepad RichEdit target."""
+
+        if not is_current():
+            return SessionEditorResult(
+                SessionEditorStatus.REJECTED,
+                "request_cancelled",
+                backend=_TARGETED_BACKEND,
+            )
+        if self.automation is None:
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "uia_unavailable",
+                backend=_TARGETED_BACKEND,
+            )
+        if expected_target.focused_class_name != RICHEDIT_D2DPT_CLASS:
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "targeted_class_unsupported",
+                backend=_TARGETED_BACKEND,
+            )
+        if expected_target.focused_hwnd <= 0:
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "targeted_handle_unavailable",
+                backend=_TARGETED_BACKEND,
+            )
+        try:
+            normalized = targeted_inserter.normalize_text(text)
+        except Exception:
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "targeted_text_unsupported",
+                backend=_TARGETED_BACKEND,
+            )
+
+        native_call_entered = False
+
+        try:
+            with self._thread_initializer():
+                control, blocked = self._verified_control(expected_target)
+                if blocked is not None or control is None:
+                    assert blocked is not None
+                    return blocked
+                pattern = self._text_pattern(control)
+                if pattern is None:
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNAVAILABLE,
+                        "text_pattern_unavailable",
+                        backend=_TARGETED_BACKEND,
+                    )
+                snapshot, reason = self._targeted_document_snapshot(pattern)
+                if snapshot is None:
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNAVAILABLE,
+                        reason,
+                        backend=_TARGETED_BACKEND,
+                    )
+                expected_document = (
+                    snapshot.prefix_text + normalized + snapshot.suffix_text
+                )
+                expected_caret_prefix = snapshot.prefix_text + normalized
+                if (
+                    self._utf16_units(expected_document)
+                    > _TARGETED_DOCUMENT_MAX_UTF16_UNITS
+                ):
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNAVAILABLE,
+                        "targeted_result_too_large",
+                        backend=_TARGETED_BACKEND,
+                    )
+
+                guard_rejection_reason: str | None = None
+
+                def before_targeted_call() -> bool:
+                    """Re-prove exact selection and focus next to EM_REPLACESEL."""
+
+                    nonlocal guard_rejection_reason
+                    if not is_current():
+                        guard_rejection_reason = "request_cancelled"
+                        return False
+                    current_selection = self._selection(pattern)
+                    if (
+                        len(current_selection) != 1
+                        or not self._selection_matches_range(
+                            current_selection[0],
+                            snapshot.selection,
+                        )
+                    ):
+                        guard_rejection_reason = "selection_changed"
+                        return False
+                    # Keep focus last.  TargetedRichEditInserter calls this
+                    # guard immediately before its bounded native message.
+                    if (
+                        self.focus_inspector.compare_current(expected_target)
+                        is not FocusMatch.SAME
+                    ):
+                        guard_rejection_reason = "focus_changed"
+                        return False
+                    # The UIA selection/focus proof may itself outlast a UI
+                    # timeout or cancellation. Re-check the generation at the
+                    # final boundary before the native backend proceeds.
+                    if not is_current():
+                        guard_rejection_reason = "request_cancelled"
+                        return False
+                    return True
+
+                native_call_entered = True
+                try:
+                    dispatch = targeted_inserter.insert(
+                        normalized,
+                        hwnd=expected_target.focused_hwnd,
+                        class_name=expected_target.focused_class_name,
+                        before_call=before_targeted_call,
+                    )
+                except Exception:
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNCERTAIN,
+                        "targeted_result_unknown",
+                        backend=_TARGETED_BACKEND,
+                    )
+                if not isinstance(dispatch, TargetedInsertionResult):
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNCERTAIN,
+                        "targeted_result_unknown",
+                        backend=_TARGETED_BACKEND,
+                    )
+                if dispatch.status is TargetedInsertionStatus.TIMEOUT:
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNCERTAIN,
+                        "targeted_insert_timeout",
+                        backend=_TARGETED_BACKEND,
+                    )
+                if dispatch.status is TargetedInsertionStatus.REJECTED:
+                    if dispatch.postcheck_required or not dispatch.safe_to_retry:
+                        return SessionEditorResult(
+                            SessionEditorStatus.UNCERTAIN,
+                            "targeted_result_unknown",
+                            backend=_TARGETED_BACKEND,
+                        )
+                    if (
+                        dispatch.reason_code == "guard_rejected"
+                        and guard_rejection_reason is not None
+                    ):
+                        return SessionEditorResult(
+                            SessionEditorStatus.REJECTED,
+                            guard_rejection_reason,
+                            backend=_TARGETED_BACKEND,
+                        )
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNAVAILABLE,
+                        dispatch.reason_code,
+                        backend=_TARGETED_BACKEND,
+                    )
+                if dispatch.status is not TargetedInsertionStatus.ACCEPTED:
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNCERTAIN,
+                        "targeted_result_unknown",
+                        backend=_TARGETED_BACKEND,
+                    )
+
+                for attempt in range(_UIA_POST_EDIT_VERIFY_ATTEMPTS):
+                    if not is_current():
+                        return SessionEditorResult(
+                            SessionEditorStatus.UNCERTAIN,
+                            "request_cancelled_after_dispatch",
+                            backend=_TARGETED_BACKEND,
+                        )
+                    if self._targeted_result_matches(
+                        pattern,
+                        expected_document,
+                        expected_caret_prefix,
+                    ):
+                        return SessionEditorResult(
+                            SessionEditorStatus.EXECUTED,
+                            "ok",
+                            backend=_TARGETED_BACKEND,
+                        )
+                    if attempt < _UIA_POST_EDIT_VERIFY_ATTEMPTS - 1:
+                        time.sleep(_UIA_POLL_INTERVAL_SECONDS)
+                return SessionEditorResult(
+                    SessionEditorStatus.UNCERTAIN,
+                    "targeted_postcheck_failed",
+                    backend=_TARGETED_BACKEND,
+                )
+        except Exception:
+            return SessionEditorResult(
+                SessionEditorStatus.UNCERTAIN
+                if native_call_entered
+                else SessionEditorStatus.UNAVAILABLE,
+                "targeted_result_unknown"
+                if native_call_entered
+                else "targeted_preflight_failed",
+                backend=_TARGETED_BACKEND,
+            )
+
+    def insert_targeted(
+        self,
+        text: str,
+        expected_target: FocusTarget,
+        targeted_inserter: TargetedRichEditInserter,
+        *,
+        is_current: Callable[[], bool] = lambda: True,
+    ) -> SessionEditorResult:
+        """Safely insert into one verified ``RichEditD2DPT`` selection."""
+
+        if not self._operation_lock.acquire(blocking=False):
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "session_editor_busy",
+                backend=_TARGETED_BACKEND,
+            )
+        try:
+            return self._insert_targeted_once(
+                text,
+                expected_target,
+                targeted_inserter,
+                is_current=is_current,
+            )
+        finally:
+            self._operation_lock.release()
+
+    def _insert_verified_once(
+        self,
+        text: str,
+        expected_target: FocusTarget,
+        *,
+        is_current: Callable[[], bool] = lambda: True,
+    ) -> SessionEditorResult:
+        """Insert with one atomic UIA preflight, SendInput and delta proof."""
+
+        try:
+            normalized = UnicodeTextInserter._validated_text(text)
+        except (TypeError, TextInsertionError, UnicodeError):
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "insertion_text_unsupported",
+                backend=_VERIFIED_INSERTION_BACKEND,
+            )
+        if not normalized:
+            return SessionEditorResult(
+                SessionEditorStatus.REJECTED,
+                "insertion_text_empty",
+                backend=_VERIFIED_INSERTION_BACKEND,
+            )
+        if len(normalized) > MAX_TRACKED_INSERTION_CHARS:
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "insertion_text_too_long",
+                backend=_VERIFIED_INSERTION_BACKEND,
+            )
+        if self.automation is None:
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "uia_unavailable",
+                backend=_VERIFIED_INSERTION_BACKEND,
+            )
+        if expected_target.uia_runtime_id is None:
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "runtime_id_unavailable",
+                backend=_VERIFIED_INSERTION_BACKEND,
+            )
+        if not is_current():
+            return SessionEditorResult(
+                SessionEditorStatus.REJECTED,
+                "request_cancelled",
+                backend=_VERIFIED_INSERTION_BACKEND,
+            )
+        # Production UnicodeTextInserter provides a one-SendInput path.  The
+        # legacy method remains a compatibility fallback for lightweight test
+        # inserters and third-party adapters that have not adopted it yet.
+        atomic_insert = getattr(self.inserter, "insert_atomic", None)
+        insert = atomic_insert
+        if not callable(insert):
+            insert = getattr(self.inserter, "insert", None)
+        if not callable(insert):
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "sendinput_unavailable",
+                backend=_VERIFIED_INSERTION_BACKEND,
+            )
+
+        native_call_entered = False
+        native_call_completed = False
+
+        def completed_but_unverified(postcheck_reason: str) -> SessionEditorResult:
+            """Classify a completed atomic call without losing cancellation."""
+
+            try:
+                still_current = bool(is_current())
+            except Exception:
+                still_current = False
+            if not still_current:
+                return SessionEditorResult(
+                    SessionEditorStatus.UNCERTAIN,
+                    "request_cancelled_after_input",
+                    backend=_VERIFIED_INSERTION_BACKEND,
+                )
+            return SessionEditorResult(
+                SessionEditorStatus.EXECUTED,
+                "ok_unverified",
+                backend=(
+                    f"{_VERIFIED_INSERTION_BACKEND}:"
+                    "guarded_unverified:postcheck_"
+                    f"{postcheck_reason}"
+                ),
+            )
+
+        try:
+            with self._thread_initializer():
+                control, blocked = self._verified_control(expected_target)
+                if blocked is not None or control is None:
+                    assert blocked is not None
+                    return SessionEditorResult(
+                        blocked.status,
+                        blocked.reason_code,
+                        backend=_VERIFIED_INSERTION_BACKEND,
+                    )
+                pattern = self._text_pattern(control)
+                if pattern is None:
+                    # Some otherwise normal native and Chromium fields expose
+                    # a stable, non-password focused UIA control but no
+                    # TextPattern.  In that narrow case ordinary typing can
+                    # still proceed.  It must use the production inserter's
+                    # one-call atomic path so the complete text is protected
+                    # by one fresh target/cancellation gate immediately before
+                    # SendInput.  This result is deliberately *not* presented
+                    # as text-verified to callers.
+                    if callable(atomic_insert):
+                        return self._insert_guarded_unverified_once(
+                            normalized,
+                            expected_target,
+                            atomic_insert,
+                            initial_runtime_id=self._runtime_id(control),
+                            is_current=is_current,
+                        )
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNAVAILABLE,
+                        "text_pattern_unavailable",
+                        backend=_VERIFIED_INSERTION_BACKEND,
+                    )
+                baseline, baseline_reason = self._insertion_baseline(pattern)
+                if baseline is None:
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNAVAILABLE,
+                        baseline_reason,
+                        backend=_VERIFIED_INSERTION_BACKEND,
+                    )
+
+                accepted_batches = 0
+                guard_rejection_reason = "input_guard_rejected"
+                guard_rejection_status = SessionEditorStatus.REJECTED
+
+                def before_input_batch() -> bool:
+                    """Re-authorize the target immediately before every batch."""
+
+                    nonlocal accepted_batches
+                    nonlocal guard_rejection_reason
+                    nonlocal guard_rejection_status
+                    if not is_current():
+                        guard_rejection_reason = "request_cancelled"
+                        guard_rejection_status = SessionEditorStatus.REJECTED
+                        return False
+                    fresh_control, fresh_blocked = self._verified_control(
+                        expected_target
+                    )
+                    if fresh_blocked is not None or fresh_control is None:
+                        assert fresh_blocked is not None
+                        guard_rejection_reason = fresh_blocked.reason_code
+                        guard_rejection_status = fresh_blocked.status
+                        return False
+                    fresh_pattern = self._text_pattern(fresh_control)
+                    if fresh_pattern is None:
+                        guard_rejection_reason = "text_pattern_unavailable"
+                        guard_rejection_status = SessionEditorStatus.UNAVAILABLE
+                        return False
+                    if accepted_batches == 0:
+                        selections = self._selection(fresh_pattern)
+                        if (
+                            len(selections) != 1
+                            or not self._selection_endpoints_match(
+                                selections[0],
+                                baseline.selection,
+                            )
+                        ):
+                            guard_rejection_reason = "selection_changed"
+                            guard_rejection_status = SessionEditorStatus.REJECTED
+                            return False
+                    # Keep the focus and generation checks adjacent to the
+                    # caller's native SendInput boundary.
+                    if (
+                        self.focus_inspector.compare_current(expected_target)
+                        is not FocusMatch.SAME
+                    ):
+                        guard_rejection_reason = "focus_changed"
+                        guard_rejection_status = SessionEditorStatus.REJECTED
+                        return False
+                    if not is_current():
+                        guard_rejection_reason = "request_cancelled"
+                        guard_rejection_status = SessionEditorStatus.REJECTED
+                        return False
+                    accepted_batches += 1
+                    return True
+
+                native_call_entered = True
+                try:
+                    insert(normalized, before_batch=before_input_batch)
+                except TextInsertionError as exc:
+                    if (
+                        exc.reason_code == "input_guard_rejected"
+                        and accepted_batches == 0
+                    ):
+                        return SessionEditorResult(
+                            guard_rejection_status,
+                            guard_rejection_reason,
+                            backend=_VERIFIED_INSERTION_BACKEND,
+                        )
+                    if exc.partial or accepted_batches > 1:
+                        return SessionEditorResult(
+                            SessionEditorStatus.UNCERTAIN,
+                            "insertion_may_be_partial",
+                            backend=_VERIFIED_INSERTION_BACKEND,
+                        )
+                    # UnicodeTextInserter's partial=False contract proves that
+                    # its sole attempted batch emitted no input events.
+                    return SessionEditorResult(
+                        SessionEditorStatus.FAILED,
+                        "insertion_input_failed",
+                        backend=_VERIFIED_INSERTION_BACKEND,
+                    )
+                except Exception:
+                    return SessionEditorResult(
+                        SessionEditorStatus.UNCERTAIN,
+                        "insertion_result_unknown",
+                        backend=_VERIFIED_INSERTION_BACKEND,
+                    )
+                # A normal return from the production atomic inserter means
+                # Windows accepted the complete event array in its one native
+                # SendInput call.  UIA read-back can still disappear or move
+                # after that boundary; loss of that optional proof must never
+                # turn a completed insertion into a retryable/partial result.
+                native_call_completed = True
+
+                last_reason = "insertion_verification_failed"
+                for attempt in range(_UIA_POST_EDIT_VERIFY_ATTEMPTS):
+                    if not is_current():
+                        return SessionEditorResult(
+                            SessionEditorStatus.UNCERTAIN,
+                            "request_cancelled_after_input",
+                            backend=_VERIFIED_INSERTION_BACKEND,
+                        )
+                    fresh_control, fresh_blocked = self._verified_control(
+                        expected_target
+                    )
+                    if fresh_blocked is not None or fresh_control is None:
+                        assert fresh_blocked is not None
+                        if fresh_blocked.status is SessionEditorStatus.REJECTED:
+                            if callable(atomic_insert) and native_call_completed:
+                                return completed_but_unverified(
+                                    fresh_blocked.reason_code
+                                )
+                            return SessionEditorResult(
+                                SessionEditorStatus.UNCERTAIN,
+                                f"{fresh_blocked.reason_code}_after_input",
+                                backend=_VERIFIED_INSERTION_BACKEND,
+                            )
+                        last_reason = fresh_blocked.reason_code
+                    else:
+                        fresh_pattern = self._text_pattern(fresh_control)
+                        if fresh_pattern is None:
+                            last_reason = "text_pattern_unavailable"
+                        else:
+                            found, reason = self._find_suffix_range(
+                                fresh_pattern,
+                                normalized,
+                                allow_owned_document=False,
+                            )
+                            if found is not None:
+                                if self._insertion_delta_matches(
+                                    fresh_pattern,
+                                    found,
+                                    baseline,
+                                ):
+                                    # The read-back can outlast one focus
+                                    # transition. Re-prove the target at the
+                                    # final success boundary as well.
+                                    if not is_current():
+                                        return SessionEditorResult(
+                                            SessionEditorStatus.UNCERTAIN,
+                                            "request_cancelled_after_input",
+                                            backend=_VERIFIED_INSERTION_BACKEND,
+                                        )
+                                    final_control, final_blocked = (
+                                        self._verified_control(expected_target)
+                                    )
+                                    if (
+                                        final_blocked is not None
+                                        or final_control is None
+                                    ):
+                                        assert final_blocked is not None
+                                        if (
+                                            callable(atomic_insert)
+                                            and native_call_completed
+                                        ):
+                                            return completed_but_unverified(
+                                                final_blocked.reason_code
+                                            )
+                                        return SessionEditorResult(
+                                            SessionEditorStatus.UNCERTAIN,
+                                            (
+                                                f"{final_blocked.reason_code}"
+                                                "_after_input"
+                                            ),
+                                            backend=_VERIFIED_INSERTION_BACKEND,
+                                        )
+                                    return SessionEditorResult(
+                                        SessionEditorStatus.EXECUTED,
+                                        "ok",
+                                        backend=(
+                                            f"{_VERIFIED_INSERTION_BACKEND}:"
+                                            f"{self._match_diagnostic}"
+                                        ),
+                                    )
+                                last_reason = "insertion_delta_unverified"
+                            else:
+                                last_reason = reason
+                    if attempt < _UIA_POST_EDIT_VERIFY_ATTEMPTS - 1:
+                        time.sleep(_UIA_POLL_INTERVAL_SECONDS)
+                if callable(atomic_insert) and native_call_completed:
+                    return completed_but_unverified(last_reason)
+                return SessionEditorResult(
+                    SessionEditorStatus.UNCERTAIN,
+                    (
+                        "insertion_verification_failed"
+                        if last_reason == "caret_or_text_changed"
+                        else last_reason
+                    ),
+                    backend=(
+                        f"{_VERIFIED_INSERTION_BACKEND}:"
+                        f"postcheck_{self._match_diagnostic}"
+                    ),
+                )
+        except Exception:
+            if callable(atomic_insert) and native_call_completed:
+                return completed_but_unverified("exception")
+            return SessionEditorResult(
+                SessionEditorStatus.UNCERTAIN
+                if native_call_entered
+                else SessionEditorStatus.UNAVAILABLE,
+                "insertion_result_unknown"
+                if native_call_entered
+                else "insertion_preflight_failed",
+                backend=_VERIFIED_INSERTION_BACKEND,
+            )
+
+    def _insert_guarded_unverified_once(
+        self,
+        normalized: str,
+        expected_target: FocusTarget,
+        atomic_insert: Callable[..., None],
+        *,
+        initial_runtime_id: tuple[int, ...] | None,
+        is_current: Callable[[], bool],
+    ) -> SessionEditorResult:
+        """Use one guarded SendInput call when TextPattern is unavailable.
+
+        The initial caller has already proved a focused, non-password control
+        with the captured RuntimeId.  The callback repeats every one of those
+        checks at the native boundary.  There is intentionally no read-back
+        claim: a fully accepted atomic call is reported as guarded/unverified.
+        """
+
+        guard_status = SessionEditorStatus.REJECTED
+        guard_reason = "input_guard_rejected"
+        guard_accepted = False
+
+        def before_native_input() -> bool:
+            nonlocal guard_accepted, guard_reason, guard_status
+            try:
+                current = bool(is_current())
+            except Exception:
+                current = False
+            if not current:
+                guard_reason = "request_cancelled"
+                guard_status = SessionEditorStatus.REJECTED
+                return False
+
+            fresh_control, fresh_blocked = self._verified_control(expected_target)
+            if fresh_blocked is not None or fresh_control is None:
+                assert fresh_blocked is not None
+                guard_reason = fresh_blocked.reason_code
+                guard_status = fresh_blocked.status
+                return False
+            if self._runtime_id(fresh_control) != initial_runtime_id:
+                guard_reason = "focus_changed"
+                guard_status = SessionEditorStatus.REJECTED
+                return False
+            if self._is_password(fresh_control):
+                guard_reason = "password_field_prohibited"
+                guard_status = SessionEditorStatus.REJECTED
+                return False
+            if (
+                self.focus_inspector.compare_current(expected_target)
+                is not FocusMatch.SAME
+            ):
+                guard_reason = "focus_changed"
+                guard_status = SessionEditorStatus.REJECTED
+                return False
+            try:
+                current = bool(is_current())
+            except Exception:
+                current = False
+            if not current:
+                guard_reason = "request_cancelled"
+                guard_status = SessionEditorStatus.REJECTED
+                return False
+            guard_accepted = True
+            return True
+
+        try:
+            atomic_insert(normalized, before_batch=before_native_input)
+        except TextInsertionError as exc:
+            if exc.reason_code == "input_guard_rejected" and not guard_accepted:
+                return SessionEditorResult(
+                    guard_status,
+                    guard_reason,
+                    backend=_GUARDED_UNVERIFIED_INSERTION_BACKEND,
+                )
+            if exc.partial:
+                return SessionEditorResult(
+                    SessionEditorStatus.UNCERTAIN,
+                    "insertion_may_be_partial",
+                    backend=_GUARDED_UNVERIFIED_INSERTION_BACKEND,
+                )
+            return SessionEditorResult(
+                SessionEditorStatus.FAILED,
+                "insertion_input_failed",
+                backend=_GUARDED_UNVERIFIED_INSERTION_BACKEND,
+            )
+        except Exception:
+            return SessionEditorResult(
+                SessionEditorStatus.UNCERTAIN,
+                "insertion_result_unknown",
+                backend=_GUARDED_UNVERIFIED_INSERTION_BACKEND,
+            )
+
+        if not guard_accepted:
+            # A non-conforming adapter may have returned without evaluating
+            # the native-boundary guard.  Its side effect cannot be known.
+            return SessionEditorResult(
+                SessionEditorStatus.UNCERTAIN,
+                "insertion_result_unknown",
+                backend=_GUARDED_UNVERIFIED_INSERTION_BACKEND,
+            )
+        return SessionEditorResult(
+            SessionEditorStatus.EXECUTED,
+            "ok_unverified",
+            backend=_GUARDED_UNVERIFIED_INSERTION_BACKEND,
+        )
+
+    def insert_verified(
+        self,
+        text: str,
+        expected_target: FocusTarget,
+        *,
+        is_current: Callable[[], bool] = lambda: True,
+    ) -> SessionEditorResult:
+        """Insert text only when UIA can prove its exact local state delta."""
+
+        if not self._operation_lock.acquire(blocking=False):
+            return SessionEditorResult(
+                SessionEditorStatus.UNAVAILABLE,
+                "session_editor_busy",
+                backend=_VERIFIED_INSERTION_BACKEND,
+            )
+        try:
+            return self._insert_verified_once(
+                text,
+                expected_target,
+                is_current=is_current,
+            )
+        finally:
+            self._operation_lock.release()
+
+    def _verify_insertion_once(
+        self,
+        expected_text: str,
+        expected_target: FocusTarget,
+        *,
+        is_current: Callable[[], bool] = lambda: True,
+    ) -> SessionEditorResult:
+        """Read back one presumed insertion without changing the document.
+
+        This method is intentionally stricter than an insertion preflight:
+        native input is assumed to have already been attempted, so a missing
+        provider, delayed text update or read failure is uncertain, never
+        evidence that no side effect happened.
+        """
+
+        if not expected_text:
+            return SessionEditorResult(
+                SessionEditorStatus.REJECTED,
+                "insertion_text_empty",
+                backend=_INSERTION_VERIFY_BACKEND,
+            )
+        if self.automation is None:
+            return SessionEditorResult(
+                SessionEditorStatus.UNCERTAIN,
+                "uia_unavailable",
+                backend=_INSERTION_VERIFY_BACKEND,
+            )
+        if not is_current():
+            return SessionEditorResult(
+                SessionEditorStatus.REJECTED,
+                "request_cancelled",
+                backend=_INSERTION_VERIFY_BACKEND,
+            )
+
+        last_reason = "insertion_verification_failed"
+        try:
+            with self._thread_initializer():
+                for attempt in range(_UIA_POST_EDIT_VERIFY_ATTEMPTS):
+                    if not is_current():
+                        return SessionEditorResult(
+                            SessionEditorStatus.REJECTED,
+                            "request_cancelled",
+                            backend=_INSERTION_VERIFY_BACKEND,
+                        )
+
+                    control, blocked = self._verified_control(expected_target)
+                    if blocked is not None or control is None:
+                        assert blocked is not None
+                        if blocked.status is SessionEditorStatus.REJECTED:
+                            # Never inspect a different or prohibited field.
+                            return SessionEditorResult(
+                                SessionEditorStatus.REJECTED,
+                                blocked.reason_code,
+                                backend=_INSERTION_VERIFY_BACKEND,
+                            )
+                        last_reason = blocked.reason_code
+                    else:
+                        pattern = self._text_pattern(control)
+                        if pattern is None:
+                            last_reason = "text_pattern_unavailable"
+                        else:
+                            found, reason = self._find_suffix_range(
+                                pattern,
+                                expected_text,
+                                # The fallback remains exact and is safe only
+                                # with the same captured UIA RuntimeId.
+                                allow_owned_document=(
+                                    expected_target.uia_runtime_id is not None
+                                ),
+                            )
+                            if found is not None:
+                                return SessionEditorResult(
+                                    SessionEditorStatus.EXECUTED,
+                                    "ok",
+                                    backend=(
+                                        f"{_INSERTION_VERIFY_BACKEND}:"
+                                        f"{self._match_diagnostic}"
+                                    ),
+                                )
+                            last_reason = reason
+
+                    if attempt < _UIA_POST_EDIT_VERIFY_ATTEMPTS - 1:
+                        time.sleep(_UIA_POLL_INTERVAL_SECONDS)
+        except Exception:
+            return SessionEditorResult(
+                SessionEditorStatus.UNCERTAIN,
+                "insertion_verification_failed",
+                backend=_INSERTION_VERIFY_BACKEND,
+            )
+
+        return SessionEditorResult(
+            SessionEditorStatus.UNCERTAIN,
+            (
+                "insertion_verification_failed"
+                if last_reason == "caret_or_text_changed"
+                else last_reason
+            ),
+            backend=(
+                f"{_INSERTION_VERIFY_BACKEND}:postcheck_{self._match_diagnostic}"
+            ),
+        )
+
+    def verify_insertion(
+        self,
+        expected_text: str,
+        expected_target: FocusTarget,
+        *,
+        is_current: Callable[[], bool] = lambda: True,
+    ) -> SessionEditorResult:
+        """Confirm an exact insertion suffix using read-only UI Automation."""
+
+        if not self._operation_lock.acquire(blocking=False):
+            return SessionEditorResult(
+                SessionEditorStatus.UNCERTAIN,
+                "session_editor_busy",
+                backend=_INSERTION_VERIFY_BACKEND,
+            )
+        try:
+            return self._verify_insertion_once(
+                expected_text,
+                expected_target,
+                is_current=is_current,
+            )
+        finally:
+            self._operation_lock.release()
 
     def apply(
         self,

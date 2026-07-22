@@ -222,6 +222,7 @@ _UPPER_CODE_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 _PUNCTUATION_REPLACEMENTS: Final[frozenset[str]] = frozenset(".,?!:;")
+_ASR_ADJACENT_PUNCTUATION: Final[frozenset[str]] = frozenset(".,?!:;…")
 _CLOSING_PUNCTUATION: Final[frozenset[str]] = frozenset(".,?!:;%)]}»”’\"'")
 _OPENING_PUNCTUATION: Final[frozenset[str]] = frozenset("([{«“‘/@#-\"'")
 
@@ -311,6 +312,14 @@ def _command_candidates(
             continue
         for match in _phrase_pattern(spec.phrase).finditer(view.text):
             start, end = _original_span(view, *match.span())
+            # Whisper can append sentence punctuation to the literal words it
+            # heard (for example ``new line.`` or ``запятая,``).  Once the
+            # complete, word-bounded phrase is matched, that attached mark is
+            # formatting noise rather than user payload.  Consume only marks
+            # directly adjacent to the closed phrase; never skip whitespace or
+            # use fuzzy matching.
+            while end < len(text) and text[end] in _ASR_ADJACENT_PUNCTUATION:
+                end += 1
             candidates.append(
                 _Operation(
                     start,
@@ -435,7 +444,13 @@ def _render_operations(text: str, operations: list[_Operation]) -> str:
         join_after_filler = False
         replacement = operation.replacement
         if replacement in _PUNCTUATION_REPLACEMENTS:
-            output = output.rstrip(" \t") + replacement
+            output = output.rstrip(" \t")
+            # If ASR inserted punctuation immediately before the spoken mark
+            # as well (``hello, comma``), the explicit spoken command wins and
+            # produces one deterministic mark instead of a duplicate.
+            while output and output[-1] in _ASR_ADJACENT_PUNCTUATION:
+                output = output[:-1].rstrip(" \t")
+            output += replacement
             trim_next = "horizontal"
             space_after_punctuation = True
         elif replacement == "\n":

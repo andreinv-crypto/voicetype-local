@@ -51,6 +51,57 @@ def test_mixed_mode_accepts_whisper_punctuation_after_command_prefix(
 
 
 @pytest.mark.parametrize(
+    ("text", "action", "payload"),
+    (
+        (
+            "КОМАНДА! Пожалуйста, удалите последнее предложение?",
+            SessionEditAction.DELETE_LAST_SENTENCE,
+            None,
+        ),
+        (
+            "COMMAND: Please, restore the last voice edit.",
+            SessionEditAction.RESTORE_LAST_EDIT,
+            None,
+        ),
+        (
+            "COMANDO… Por favor, elimine la última oración.",
+            SessionEditAction.DELETE_LAST_SENTENCE,
+            None,
+        ),
+        (
+            "Команда, замените: последнее слово на: готово.",
+            SessionEditAction.REPLACE_LAST_WORD,
+            "готово.",
+        ),
+        (
+            "COMMAND—Replace, the last sentence with: Done!",
+            SessionEditAction.REPLACE_LAST_SENTENCE,
+            "Done!",
+        ),
+        (
+            "COMANDO: Reemplace, la última frase por: Listo.",
+            SessionEditAction.REPLACE_LAST_SENTENCE,
+            "Listo.",
+        ),
+    ),
+)
+def test_closed_asr_case_punctuation_and_inflection_variants(
+    text: str,
+    action: SessionEditAction,
+    payload: str | None,
+) -> None:
+    result = SessionEditCommandParser().parse(
+        text,
+        mode="mixed",
+        language="auto",
+    )
+
+    assert result.request is not None
+    assert result.request.action is action
+    assert result.request.new_text == payload
+
+
+@pytest.mark.parametrize(
     ("text", "language", "action"),
     (
         ("удалить последнее предложение", "ru", SessionEditAction.DELETE_LAST_SENTENCE),
@@ -208,6 +259,24 @@ def test_new_russian_aliases_do_not_widen_mixed_mode_prefix_or_politeness(
 
     assert not result.recognized
     assert result.request is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "please delete the last word",
+        "por favor borre la última palabra",
+        "command please please delete the last word",
+        "comando por favor por favor borre la última palabra",
+        "command delete approximately the last word",
+        "comando elimina algo parecido a la última frase",
+    ),
+)
+def test_asr_tolerance_remains_prefixed_anchored_and_non_fuzzy(text: str) -> None:
+    result = SessionEditCommandParser().parse(text, mode="mixed", language="auto")
+
+    assert result.request is None
+    assert not result.recognized or result.reason_code == "invalid_edit_command"
 
 
 @pytest.mark.parametrize(

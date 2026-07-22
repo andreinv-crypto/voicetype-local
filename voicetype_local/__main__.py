@@ -24,6 +24,14 @@ def _self_test() -> int:
     if editor_code:
         return editor_code
 
+    from voicetype_local.windows_targeted_inserter_probe import (
+        run_isolated_targeted_inserter_probe,
+    )
+
+    targeted_code, _targeted_label = run_isolated_targeted_inserter_probe()
+    if targeted_code:
+        return targeted_code
+
     from voicetype_local.audio import AudioRecorder
     from voicetype_local.config import Settings
     from voicetype_local.inserter import INPUT, UnicodeTextInserter

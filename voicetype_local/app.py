@@ -16,7 +16,7 @@ from typing import BinaryIO
 from . import __version__
 from .audio import AudioRecorder
 from .config import SettingsStore
-from .correction import CorrectionContext
+from .correction import CorrectionContext, CorrectionPipeline, LocalBasicCorrector
 from .diagnostics import TechnicalLogger
 from .dictation_transform import combine_insertions, transform_dictation
 from .focus import FocusInspector, FocusMatch, FocusTarget, focus_app_id
@@ -37,6 +37,13 @@ from .session_editing import (
 )
 from .session_editor import SessionEditorResult, SessionEditorStatus, SessionTextEditor
 from .settings_ui import SettingsWindow, open_settings_window
+from .targeted_inserter import RICHEDIT_D2DPT_CLASS, TargetedRichEditInserter
+from .test_lab import (
+    QuickTestEvent,
+    QuickTestSessionSnapshot,
+    QuickTestWindow,
+    open_quick_test_window,
+)
 from .text_rules import SafeNormalizer
 from .transcriber import OfflineTranscriber
 from .ui import CommandHelpWindow, NumberOverlay, StatusOverlay, TrayController
@@ -56,6 +63,8 @@ AUTOMATIC_SPACING_TTL_SECONDS = 30.0
 NUMBER_SNAPSHOT_POLL_MS = 500
 SESSION_EDIT_TTL_SECONDS = 600.0
 SESSION_EDIT_TIMEOUT_SECONDS = 5.0
+TARGETED_INSERT_TIMEOUT_SECONDS = 5.0
+SENDINPUT_VERIFY_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +82,17 @@ class _SessionEditTransaction:
     target: FocusTarget
     created_at: float
     allow_empty_restore: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingInsert:
+    """One recognized payload waiting for an explicit, newly verified target."""
+
+    payload: str
+    source_target: FocusTarget | None
+    created_at: float
+    reason_code: str
+    uncertain: bool = False
 
 
 class AppState(enum.StrEnum):
@@ -137,6 +157,9 @@ class VoiceTypeApp:
         self.correction_pipeline = build_correction_pipeline(
             settings, secret_store=self.secret_store
         )
+        # Test Lab must remain local even when the everyday profile opts into
+        # a cloud text corrector.  The instance is stateless and stores no text.
+        self._quick_test_local_correction = CorrectionPipeline(LocalBasicCorrector())
         self.cloud_transcriber = build_cloud_transcriber(
             settings, secret_store=self.secret_store
         )
@@ -144,7 +167,12 @@ class VoiceTypeApp:
         self.recorder = self._recorder_factory()
         self.inserter = UnicodeTextInserter()
         self.focus_inspector = FocusInspector()
-        self.session_editor = SessionTextEditor(self.inserter, self.focus_inspector)
+        self.targeted_inserter = TargetedRichEditInserter()
+        self.session_editor = SessionTextEditor(
+            self.inserter,
+            self.focus_inspector,
+            targeted_inserter=self.targeted_inserter,
+        )
         self.voice_router = VoiceControlRouter()
         self.control_executor = WindowsControlExecutor()
         self.state = AppState.LOADING
@@ -161,12 +189,15 @@ class VoiceTypeApp:
             "tone": "ready",
         }
         self._insertion_uncertain = False
+        self._pending_insert: _PendingInsert | None = None
+        self._pending_repeat_waiting = False
         self._last_insertion_target: FocusTarget | None = None
         self._last_insertion_at = 0.0
         self._last_insertion_tail = ""
         self._tracked_session_insertion: _TrackedSessionInsertion | None = None
         self._last_session_edit: _SessionEditTransaction | None = None
         self._pending_control_request: ControlRequest | None = None
+        self._pending_control_target: FocusTarget | None = None
         self._pending_dictation_action: tuple[
             int, ControlRequest, str
         ] | None = None
@@ -199,6 +230,16 @@ class VoiceTypeApp:
         self._silent_start = bool(silent_start)
         self._settings_window: SettingsWindow | None = None
         self._memory_window: MemoryWindow | None = None
+        self._quick_test_window: QuickTestWindow | None = None
+        self._quick_test_event_sequence = 0
+        # This separate guard deliberately does not depend on Tk/window calls.
+        # If the Test Lab window becomes unreadable, voice routing fails closed
+        # until its explicit cleanup completes.
+        self._quick_test_guard_active = False
+        self._quick_test_guard_broken = False
+        self._quick_test_cycle_active = False
+        self._quick_test_attempted = False
+        self._quick_test_ram_dirty = False
         self._microphone_options_cache: tuple[str, ...] = ()
         self._microphone_scan_lock = threading.Lock()
         self._microphone_scan_in_progress = False
@@ -386,6 +427,7 @@ class VoiceTypeApp:
             on_clear_session=self.clear_session_text,
             on_memory=self.open_memory,
             on_help=self.open_command_help,
+            on_quick_test=self.open_quick_test,
             has_last_text=bool(self.last_text),
             has_raw_text=bool(self.last_raw_text),
             microphone_options=self._microphone_options_cache,
@@ -473,6 +515,236 @@ class VoiceTypeApp:
             self.memory_store,
             on_close=lambda: setattr(self, "_memory_window", None),
         )
+
+    def _quick_test_snapshot(self) -> QuickTestSessionSnapshot:
+        tracked = self._tracked_session_insertion
+        return QuickTestSessionSnapshot(
+            generation=self._generation,
+            target_hwnd=(tracked.target.focused_hwnd if tracked is not None else 0),
+            tracked_text=(tracked.text if tracked is not None else None),
+        )
+
+    def _active_quick_test(self) -> QuickTestWindow | None:
+        window = getattr(self, "_quick_test_window", None)
+        if window is None:
+            return None
+        try:
+            return window if window.active else None
+        except Exception:
+            return None
+
+    def _quick_test_closed(self) -> None:
+        if (
+            bool(getattr(self, "_quick_test_ram_dirty", False))
+            and not self._closing
+        ):
+            self._reset_quick_test_session()
+        self._quick_test_guard_active = False
+        self._quick_test_guard_broken = False
+        self._quick_test_cycle_active = False
+        self._quick_test_attempted = False
+        self._quick_test_ram_dirty = False
+        self._quick_test_window = None
+
+    def _reset_quick_test_session(self) -> None:
+        """Scrub Test Lab text once while preserving untouched pre-lab RAM."""
+
+        if not bool(getattr(self, "_quick_test_ram_dirty", False)):
+            return
+        self.clear_session_text()
+        self._quick_test_ram_dirty = False
+
+    def _abort_quick_test_cycle(self, _restarting: bool = False) -> None:
+        """Invalidate in-flight Test Lab work before its HWND is reset/destroyed."""
+
+        attempted = bool(getattr(self, "_quick_test_attempted", False))
+        cycle_active = bool(getattr(self, "_quick_test_cycle_active", False))
+        if _restarting:
+            self._quick_test_guard_broken = False
+        if not attempted and not cycle_active:
+            return
+        self._quick_test_cycle_active = False
+        if self.state in {
+            AppState.STARTING,
+            AppState.RECORDING,
+            AppState.PROCESSING,
+            AppState.PENDING_INSERT,
+        }:
+            self.cancel()
+        if bool(getattr(self, "_quick_test_ram_dirty", False)):
+            self._reset_quick_test_session()
+        # QuickTestWindow calls its reset callback after this invalidation when
+        # an actual lab operation reached the app.  Keeping cancellation and
+        # RAM scrubbing separate preserves pre-lab session text if the user
+        # merely opened the window and closed it before dictating anything.
+        self._quick_test_attempted = False
+
+    def open_quick_test(self) -> None:
+        """Open one isolated native field for a short end-to-end voice check."""
+
+        if self._closing:
+            return
+        existing = self._active_quick_test()
+        if existing is not None:
+            try:
+                self._quick_test_guard_active = True
+                existing.window.deiconify()
+                existing.window.lift()
+                existing.window.focus_force()
+                existing.window.after(80, existing.native_field.focus)
+                return
+            except tk.TclError:
+                self._quick_test_window = None
+        if self.state is not AppState.IDLE:
+            self._show_status(
+                "Сначала завершите или отмените текущую запись, затем откройте быструю проверку.",
+                "warning",
+                3500,
+            )
+            return
+        self._clear_pending_dictation_action()
+        self._clear_pending_control()
+        self._hide_number_overlay()
+        settings = self.settings_store.get()
+        try:
+            window = open_quick_test_window(
+                self.root,
+                language=settings.language,
+                activation_label=self._activation_key_label(),
+                activation_mode=settings.activation_mode,
+                start_generation=self._generation,
+                snapshot_provider=self._quick_test_snapshot,
+                on_reset_session=self._reset_quick_test_session,
+                on_abort_cycle=self._abort_quick_test_cycle,
+                on_close=self._quick_test_closed,
+            )
+            self._quick_test_window = window
+            self._quick_test_guard_active = True
+            self._quick_test_guard_broken = False
+            self._quick_test_cycle_active = False
+            self._quick_test_attempted = False
+            self._quick_test_ram_dirty = False
+        except Exception:
+            self._quick_test_guard_active = False
+            self._quick_test_guard_broken = False
+            self._quick_test_cycle_active = False
+            self._quick_test_attempted = False
+            self._quick_test_ram_dirty = False
+            self._quick_test_window = None
+            self._show_status(
+                "Не удалось открыть безопасное тестовое поле.",
+                "error",
+                4000,
+            )
+
+    def _quick_test_route_mode(
+        self, target_focus: FocusTarget | None
+    ) -> str | None:
+        window = self._active_quick_test()
+        if window is None:
+            return None
+        try:
+            if not window.owns_target(target_focus):
+                return None
+            expected_kind, _expected_action = window.route_expectation()
+        except Exception:
+            return None
+        if expected_kind == "dictation":
+            return "dictation"
+        # Exact command prefixes are used in the lab regardless of the user's
+        # saved everyday mode. This override is transient and never persisted.
+        return "mixed"
+
+    def _quick_test_route_allowed(
+        self,
+        route: VoiceRoute,
+        target_focus: FocusTarget | None,
+    ) -> tuple[bool, str]:
+        guarded = bool(getattr(self, "_quick_test_guard_active", False))
+        window = self._active_quick_test()
+        if not guarded:
+            return True, ""
+        if bool(getattr(self, "_quick_test_guard_broken", False)):
+            return False, "quick_test_guard_error"
+        if window is None:
+            return False, "quick_test_guard_error"
+        try:
+            owns_target = window.owns_target(target_focus)
+        except Exception:
+            return False, "quick_test_guard_error"
+        if not owns_target:
+            return False, "focus_changed"
+        try:
+            expected_kind, expected_action = window.route_expectation()
+        except Exception:
+            return False, "quick_test_guard_error"
+        if expected_kind == "dictation":
+            if route.kind is VoiceRouteKind.DICTATION:
+                return True, ""
+            return False, "unexpected_route"
+        if expected_kind == "session_edit":
+            if (
+                route.kind is VoiceRouteKind.SESSION_EDIT
+                and route.edit_request is not None
+                and route.edit_request.action is expected_action
+            ):
+                return True, ""
+            return False, "unexpected_route"
+        return False, "quick_test_complete"
+
+    def _emit_quick_test_event(
+        self,
+        *,
+        generation: int,
+        kind: str,
+        status: str,
+        operation: str,
+        reason_code: str = "",
+        backend: str | None = None,
+        duration_ms: int = 0,
+    ) -> None:
+        window = self._active_quick_test()
+        if window is None:
+            if bool(getattr(self, "_quick_test_guard_active", False)):
+                self._quick_test_guard_broken = True
+                self._quick_test_cycle_active = False
+                self._show_status(
+                    "Быстрая проверка остановлена безопасно. Закройте её и откройте снова.",
+                    "error",
+                    4000,
+                )
+            return
+        self._quick_test_cycle_active = False
+        self._quick_test_event_sequence = (
+            int(getattr(self, "_quick_test_event_sequence", 0)) + 1
+        )
+        event = QuickTestEvent(
+            sequence=self._quick_test_event_sequence,
+            generation=int(generation),
+            kind=str(kind)[:40],
+            status=(
+                status
+                if status in {"passed", "rejected", "failed"}
+                else "failed"
+            ),
+            operation=str(operation)[:80],
+            reason_code=str(reason_code or "")[:80],
+            backend=str(backend or "")[:80],
+            duration_ms=max(0, int(duration_ms)),
+        )
+        try:
+            window.handle_event(event)
+        except Exception:
+            self._quick_test_guard_broken = True
+            try:
+                window.stop_with_internal_error()
+            except Exception:
+                pass
+            self._show_status(
+                "Быстрая проверка остановлена из-за внутренней ошибки; обычная диктовка не повреждена.",
+                "error",
+                4000,
+            )
 
     def _settings_saved(self, changes: dict[str, object]) -> None:
         previous = self.settings_store.get()
@@ -586,7 +858,7 @@ class VoiceTypeApp:
             AppState.PENDING_INSERT,
         } or bool(self._pending_control_request) or bool(
             self.number_overlay.snapshot_id
-        )
+        ) or self._active_quick_test() is not None
 
     def _set_state(self, state: AppState, title: str) -> None:
         self.state = state
@@ -717,24 +989,65 @@ class VoiceTypeApp:
             return
         settings = self.settings_store.get()
         target_focus = self.focus_inspector.capture()
-        app_id = focus_app_id(target_focus) if settings.app_scoped_memory else None
-        domain = settings.active_domains[0] if settings.active_domains else None
+        guarded_quick_test = bool(
+            getattr(self, "_quick_test_guard_active", False)
+        )
+        if guarded_quick_test and bool(
+            getattr(self, "_quick_test_guard_broken", False)
+        ):
+            self._quick_test_cycle_active = False
+            self._show_status(
+                "Быстрая проверка остановлена. Нажмите «Начать заново».",
+                "error",
+                3200,
+            )
+            return
+        quick_test_window = self._active_quick_test()
+        quick_test_cycle = False
+        if guarded_quick_test and quick_test_window is not None:
+            try:
+                quick_test_cycle = bool(
+                    quick_test_window.owns_target(target_focus)
+                )
+            except Exception:
+                quick_test_cycle = False
+        if guarded_quick_test and not quick_test_cycle:
+            self._quick_test_cycle_active = False
+            self._show_status(
+                "Быстрая проверка ещё открыта. Вернитесь в белое поле или закройте её для обычной диктовки.",
+                "warning",
+                4200,
+            )
+            return
+        app_id = (
+            None
+            if quick_test_cycle
+            else focus_app_id(target_focus) if settings.app_scoped_memory else None
+        )
+        domain = (
+            None
+            if quick_test_cycle
+            else settings.active_domains[0] if settings.active_domains else None
+        )
         memory_context = MemoryContext(
             language=None if settings.language == "auto" else settings.language,
             domain=domain,
             app_id=app_id,
         )
-        try:
-            pre_prompt = self.prompt_builder.build_pre_asr(
-                self.memory_store, memory_context
-            )
-        except Exception as exc:
-            self.logger.event(
-                "memory_prompt_failed",
-                operation="pre_asr",
-                error_type=type(exc).__name__,
-            )
+        if quick_test_cycle:
             pre_prompt = None
+        else:
+            try:
+                pre_prompt = self.prompt_builder.build_pre_asr(
+                    self.memory_store, memory_context
+                )
+            except Exception as exc:
+                self.logger.event(
+                    "memory_prompt_failed",
+                    operation="pre_asr",
+                    error_type=type(exc).__name__,
+                )
+                pre_prompt = None
         recorder = self._recorder_factory()
         self.recorder = recorder
         self._generation += 1
@@ -743,6 +1056,9 @@ class VoiceTypeApp:
         self._target_focus = target_focus
         self._memory_context = memory_context
         self._pre_prompt = pre_prompt
+        self._quick_test_cycle_active = quick_test_cycle
+        if quick_test_cycle:
+            self._quick_test_attempted = True
 
         self.state = AppState.STARTING
         threading.Thread(
@@ -780,6 +1096,7 @@ class VoiceTypeApp:
     def _recording_start_failed(self, error: Exception, generation: int) -> None:
         if generation != self._generation or self.state != AppState.STARTING:
             return
+        self._quick_test_cycle_active = False
         self._target_focus = None
         self._set_state(AppState.IDLE, "готов")
         self._show_status(f"Микрофон недоступен: {error}", "error", 5000)
@@ -818,6 +1135,7 @@ class VoiceTypeApp:
             return
         if generation != self._generation or self.state != AppState.STARTING:
             return
+        self._quick_test_cycle_active = False
         self._generation += 1
         native_open_stuck = bool(
             getattr(recorder, "native_open_unabortable", False)
@@ -867,15 +1185,17 @@ class VoiceTypeApp:
 
     def _auto_stop(self) -> None:
         if self.state == AppState.RECORDING:
-            self.stop_recording()
+            self.stop_recording(refresh_target=False)
 
     def _cancel_timer(self) -> None:
         if self._record_timer is not None:
             self._record_timer.cancel()
             self._record_timer = None
 
-    def stop_recording(self) -> None:
+    def stop_recording(self, *, refresh_target: bool = True) -> None:
         self._cancel_timer()
+        if refresh_target:
+            self._refresh_target_focus_at_stop()
         recorder = self.recorder
         duration = recorder.duration
         self._sound("SystemExclamation")
@@ -883,6 +1203,7 @@ class VoiceTypeApp:
         language = settings.language
         self._generation += 1
         generation = self._generation
+        force_local = bool(getattr(self, "_quick_test_cycle_active", False))
         self._processing_started_at = time.monotonic()
         self._processing_stage = "audio_stop"
 
@@ -892,7 +1213,7 @@ class VoiceTypeApp:
         self.state = AppState.PROCESSING
         threading.Thread(
             target=self._finish_recording_worker,
-            args=(recorder, duration, language, generation),
+            args=(recorder, duration, language, generation, force_local),
             name="audio-stop-and-transcription",
             daemon=True,
         ).start()
@@ -911,6 +1232,7 @@ class VoiceTypeApp:
         duration: float,
         language: str,
         generation: int,
+        force_local: bool = False,
     ) -> None:
         stop_started = time.monotonic()
         try:
@@ -930,7 +1252,12 @@ class VoiceTypeApp:
             audio_buffer.close()
             self.post(lambda: self._recording_too_short(generation))
             return
-        self._transcribe_worker(audio_buffer, language, generation)
+        self._transcribe_worker(
+            audio_buffer,
+            language,
+            generation,
+            force_local=force_local,
+        )
 
     def _audio_stop_timeout(
         self, generation: int, recorder: AudioRecorder
@@ -943,6 +1270,7 @@ class VoiceTypeApp:
             or self._processing_stage != "audio_stop"
         ):
             return
+        self._quick_test_cycle_active = False
         self._generation += 1
         self._target_focus = None
         self.recorder = self._recorder_factory()
@@ -960,6 +1288,7 @@ class VoiceTypeApp:
     def _recording_stop_failed(self, error: Exception, generation: int) -> None:
         if generation != self._generation or self.state != AppState.PROCESSING:
             return
+        self._quick_test_cycle_active = False
         self._target_focus = None
         self._set_state(AppState.IDLE, "готов")
         self._show_status(f"Запись не получена: {error}", "error", 4000)
@@ -972,6 +1301,7 @@ class VoiceTypeApp:
     def _recording_too_short(self, generation: int) -> None:
         if generation != self._generation or self.state != AppState.PROCESSING:
             return
+        self._quick_test_cycle_active = False
         self._target_focus = None
         self._set_state(AppState.IDLE, "готов")
         self._show_status("Слишком короткая запись", "cancelled", 1600)
@@ -988,7 +1318,12 @@ class VoiceTypeApp:
             label = "Нахожу доступные элементы"
         elif self._processing_stage == "session_edit":
             label = "Проверяю и исправляю последний текст"
-        elif self.cloud_transcriber is not None:
+        elif self._processing_stage in {"targeted_insert", "sendinput_verify"}:
+            label = "Проверяю вставку текста"
+        elif (
+            not bool(getattr(self, "_quick_test_cycle_active", False))
+            and self.cloud_transcriber is not None
+        ):
             label = "Распознаю"
         else:
             label = "Распознаю локально"
@@ -1002,10 +1337,15 @@ class VoiceTypeApp:
             self.root.after(2000, lambda: self._processing_heartbeat(generation))
 
     def _transcribe_worker(
-        self, audio_buffer: BinaryIO, language: str, generation: int
+        self,
+        audio_buffer: BinaryIO,
+        language: str,
+        generation: int,
+        *,
+        force_local: bool = False,
     ) -> None:
         local_transcriber = self.transcriber
-        cloud_transcriber = self.cloud_transcriber
+        cloud_transcriber = None if force_local else self.cloud_transcriber
         if self._closing or generation != self._generation:
             audio_buffer.close()
             return
@@ -1060,6 +1400,7 @@ class VoiceTypeApp:
     def _transcription_failed(self, error: Exception, generation: int) -> None:
         if generation != self._generation or self.state != AppState.PROCESSING:
             return
+        self._quick_test_cycle_active = False
         self._clear_pending_dictation_action()
         self._target_focus = None
         self._set_state(AppState.IDLE, "готов")
@@ -1180,6 +1521,7 @@ class VoiceTypeApp:
     def _clear_pending_control(self, *, notify_executor: bool = True) -> None:
         self._pending_control_token += 1
         self._pending_control_request = None
+        self._pending_control_target = None
         self._pending_control_deadline = 0.0
         if notify_executor:
             try:
@@ -1310,7 +1652,11 @@ class VoiceTypeApp:
             # snapshot while the user is being asked for confirmation.
             if route.request.intent is not CanonicalIntent.INVOKE_NUMBERED_ELEMENT:
                 self._hide_number_overlay()
-            self._start_control_request(route.request, generation)
+            self._start_control_request(
+                route.request,
+                generation,
+                expected_target=target_focus,
+            )
             return
         self._set_state(AppState.IDLE, "готов")
         self._show_status("Команда не поддерживается", "error", 2500)
@@ -1379,6 +1725,15 @@ class VoiceTypeApp:
             "voice_command_blocked",
             operation=request.action.value,
             code=reason_code,
+            backend=backend,
+            duration_ms=duration_ms,
+        )
+        self._emit_quick_test_event(
+            generation=self._generation,
+            kind="session_edit",
+            status="failed" if uncertain else "rejected",
+            operation=request.action.value,
+            reason_code=reason_code,
             backend=backend,
             duration_ms=duration_ms,
         )
@@ -1611,6 +1966,15 @@ class VoiceTypeApp:
             backend=result.backend,
             duration_ms=duration_ms,
         )
+        self._emit_quick_test_event(
+            generation=generation,
+            kind="session_edit",
+            status="passed",
+            operation=request.action.value,
+            reason_code="ok",
+            backend=result.backend,
+            duration_ms=duration_ms,
+        )
 
     def _capture_numbered_worker(self, generation: int) -> None:
         try:
@@ -1675,11 +2039,12 @@ class VoiceTypeApp:
         generation: int,
         *,
         confirmed: bool = False,
+        expected_target: FocusTarget | None = None,
     ) -> None:
         self._processing_stage = "command"
         threading.Thread(
             target=self._execute_control_worker,
-            args=(request, generation, confirmed),
+            args=(request, generation, confirmed, expected_target),
             name="windows-control",
             daemon=True,
         ).start()
@@ -1690,34 +2055,77 @@ class VoiceTypeApp:
         request: ControlRequest,
         generation: int,
         confirmed: bool,
+        expected_target: FocusTarget | None,
     ) -> None:
         started = time.monotonic()
-        try:
-            result = self.control_executor.execute(request, confirmed=confirmed)
-        except Exception:
+        if (
+            expected_target is not None
+            and self.focus_inspector.compare_current(expected_target)
+            is not FocusMatch.SAME
+        ):
             result = ControlResult(
-                ResultStatus.FAILED,
+                ResultStatus.REJECTED,
                 request.intent,
-                reason_code="executor_failed",
+                reason_code="focus_changed",
             )
+        else:
+            try:
+                input_guard = None
+                if expected_target is not None and request.intent in {
+                    CanonicalIntent.SEND_KEY,
+                    CanonicalIntent.SEND_HOTKEY,
+                }:
+                    input_guard = (
+                        lambda expected_target=expected_target: (
+                            not self._closing
+                            and generation == self._generation
+                            and self.state is AppState.PROCESSING
+                            and self._processing_stage == "command"
+                            and self.focus_inspector.compare_current(
+                                expected_target
+                            )
+                            is FocusMatch.SAME
+                        )
+                    )
+                result = self.control_executor.execute(
+                    request,
+                    confirmed=confirmed,
+                    input_guard=input_guard,
+                )
+            except Exception:
+                result = ControlResult(
+                    ResultStatus.FAILED,
+                    request.intent,
+                    reason_code="executor_failed",
+                )
         duration_ms = round((time.monotonic() - started) * 1000)
         if self._closing or generation != self._generation:
             return
         self.post(
             lambda: self._control_result_ready(
-                result, request, generation, duration_ms
+                result,
+                request,
+                generation,
+                duration_ms,
+                expected_target=expected_target,
             )
         )
 
     def _confirm_pending_control(self, generation: int) -> None:
         request = self._pending_control_request
+        expected_target = self._pending_control_target
         if request is None or time.monotonic() > self._pending_control_deadline:
             self._clear_pending_control()
             self._hide_number_overlay()
             self._set_state(AppState.IDLE, "готов")
             self._show_status("Нет команды, ожидающей подтверждения", "cancelled", 2500)
             return
-        self._start_control_request(request, generation, confirmed=True)
+        self._start_control_request(
+            request,
+            generation,
+            confirmed=True,
+            expected_target=expected_target,
+        )
 
     def _control_result_ready(
         self,
@@ -1725,6 +2133,8 @@ class VoiceTypeApp:
         request: ControlRequest,
         generation: int,
         duration_ms: int,
+        *,
+        expected_target: FocusTarget | None = None,
     ) -> None:
         if generation != self._generation or self.state != AppState.PROCESSING:
             return
@@ -1732,6 +2142,7 @@ class VoiceTypeApp:
             self._pending_control_token += 1
             token = self._pending_control_token
             self._pending_control_request = request
+            self._pending_control_target = expected_target
             self._pending_control_deadline = (
                 time.monotonic() + CONTROL_CONFIRMATION_TTL_SECONDS
             )
@@ -1809,20 +2220,25 @@ class VoiceTypeApp:
             return
         if not text:
             self._clear_pending_dictation_action()
+            self._quick_test_cycle_active = False
             self._target_focus = None
             self._set_state(AppState.IDLE, "готов")
             self._show_status("Речь не обнаружена", "cancelled", 1800)
             return
         settings = self.settings_store.get()
+        quick_test_cycle = bool(
+            getattr(self, "_quick_test_cycle_active", False)
+        )
         heard_text = text
         command_focus = self._target_focus
         self._clear_pending_dictation_action()
         parser_language = (
             "auto" if settings.language == "auto" else settings.language
         )
+        quick_test_mode = self._quick_test_route_mode(command_focus)
         route = self.voice_router.route(
             text,
-            mode=settings.interaction_mode,
+            mode=quick_test_mode or settings.interaction_mode,
             language=parser_language,
             snapshot_id=self._current_snapshot_id(),
         )
@@ -1841,6 +2257,36 @@ class VoiceTypeApp:
             )
             if pending_route.kind in {VoiceRouteKind.CONFIRM, VoiceRouteKind.CANCEL}:
                 route = pending_route
+        quick_test_allowed, quick_test_reason = self._quick_test_route_allowed(
+            route,
+            command_focus,
+        )
+        if not quick_test_allowed:
+            self._clear_pending_dictation_action()
+            self._clear_pending_control()
+            self._hide_number_overlay()
+            self._target_focus = None
+            self._set_state(AppState.IDLE, "готов")
+            self._set_runtime_feedback(
+                heard="Тестовая фраза не подошла",
+                text="",
+                command="",
+                outcome="Быстрая проверка: повторите текущую фразу",
+                tone="warning",
+            )
+            self._show_status(
+                "Быстрая проверка: повторите фразу текущего шага",
+                "warning",
+                2800,
+            )
+            self._emit_quick_test_event(
+                generation=generation,
+                kind="route",
+                status="rejected",
+                operation=route.kind.value,
+                reason_code=quick_test_reason,
+            )
+            return
         if (
             self._pending_control_request is not None
             and route.kind not in {VoiceRouteKind.CONFIRM, VoiceRouteKind.CANCEL}
@@ -1860,6 +2306,8 @@ class VoiceTypeApp:
             return
         self._hide_number_overlay()
         text = route.dictation_text or text
+        if quick_test_cycle:
+            self._quick_test_ram_dirty = True
         self.last_raw_text = heard_text
         if (
             route.kind is VoiceRouteKind.DICTATION_THEN_CONTROL
@@ -1917,44 +2365,49 @@ class VoiceTypeApp:
             )
         context = MemoryContext(
             language=language or self._memory_context.language,
-            domain=self._memory_context.domain,
-            app_id=self._memory_context.app_id,
+            domain=None if quick_test_cycle else self._memory_context.domain,
+            app_id=None if quick_test_cycle else self._memory_context.app_id,
         )
         terms: tuple[str, ...] = ()
         styles: dict[str, str] = {}
         local_text = text
-        try:
-            post_prompt = self.prompt_builder.build_post_asr(
-                self.memory_store, text, context
-            )
-            terms = tuple(term.canonical_text for term in post_prompt.terms)
-            styles = {item.key: item.value for item in post_prompt.styles}
-            rules = self.memory_store.replacement_candidates(
-                context, draft=text
-            )
-            normalized = self.normalizer.normalize(
-                text, rules, protected_terms=terms
-            )
-            local_text = normalized.text
-            used_ids = {
-                item.term_id
-                for item in normalized.applied
-                if item.term_id is not None
-            }
-            if used_ids:
-                self.memory_store.mark_terms_used(used_ids)
-        except Exception as exc:
-            self.logger.event(
-                "memory_postprocess_failed",
-                operation="post_asr",
-                error_type=type(exc).__name__,
-            )
+        if not quick_test_cycle:
+            try:
+                post_prompt = self.prompt_builder.build_post_asr(
+                    self.memory_store, text, context
+                )
+                terms = tuple(term.canonical_text for term in post_prompt.terms)
+                styles = {item.key: item.value for item in post_prompt.styles}
+                rules = self.memory_store.replacement_candidates(
+                    context, draft=text
+                )
+                normalized = self.normalizer.normalize(
+                    text, rules, protected_terms=terms
+                )
+                local_text = normalized.text
+                used_ids = {
+                    item.term_id
+                    for item in normalized.applied
+                    if item.term_id is not None
+                }
+                if used_ids:
+                    self.memory_store.mark_terms_used(used_ids)
+            except Exception as exc:
+                self.logger.event(
+                    "memory_postprocess_failed",
+                    operation="post_asr",
+                    error_type=type(exc).__name__,
+                )
         self.last_local_text = local_text
         self._processing_stage = "correction"
         correction_context = CorrectionContext(
             language=language or "auto", terms=terms, style=styles
         )
-        correction_pipeline = self.correction_pipeline
+        correction_pipeline = (
+            self._quick_test_local_correction
+            if quick_test_cycle
+            else self.correction_pipeline
+        )
         threading.Thread(
             target=self._correction_worker,
             args=(
@@ -2001,6 +2454,49 @@ class VoiceTypeApp:
         self._last_insertion_at = 0.0
         self._last_insertion_tail = ""
 
+    def _set_pending_insert(
+        self,
+        payload: str,
+        target: FocusTarget | None,
+        reason_code: str,
+        *,
+        uncertain: bool = False,
+    ) -> None:
+        """Retain one bounded RAM-only recovery payload until insert/cancel/exit."""
+
+        self._pending_insert = _PendingInsert(
+            payload=payload,
+            source_target=target,
+            created_at=time.monotonic(),
+            reason_code=reason_code,
+            uncertain=uncertain,
+        )
+
+    def _update_pending_insert(
+        self,
+        reason_code: str,
+        *,
+        uncertain: bool,
+    ) -> None:
+        pending = self._pending_insert
+        if pending is None:
+            self._set_pending_insert(
+                self.last_text,
+                None,
+                reason_code,
+                uncertain=uncertain,
+            )
+            return
+        self._set_pending_insert(
+            pending.payload,
+            pending.source_target,
+            reason_code,
+            uncertain=uncertain,
+        )
+
+    def _clear_pending_insert(self) -> None:
+        self._pending_insert = None
+
     def _automatic_spacing_payload(
         self,
         text: str,
@@ -2044,100 +2540,425 @@ class VoiceTypeApp:
         # than that avoids turning this session-only tracker into text history.
         self._last_insertion_tail = text[-1:]
 
-    def _final_text_ready(
-        self, text: str, language: str, probability: float, generation: int
-    ) -> None:
-        if generation != self._generation or self.state != AppState.PROCESSING:
-            return
-        self.last_text = text
-        self._set_runtime_feedback(text=text)
-        self._insertion_uncertain = False
-        self._update_menu()
-        target_focus = self._target_focus
-        self._target_focus = None
-        focus_match = self.focus_inspector.compare_current(target_focus)
-        if focus_match is not FocusMatch.SAME:
-            had_action = self._pending_dictation_action is not None
-            self._clear_pending_dictation_action()
-            self._clear_automatic_spacing_context()
-            self._set_state(AppState.PENDING_INSERT, "текст ждёт вставки")
-            self._show_status(
-                f"Текст сохранён до выхода. Поставьте курсор куда нужно и нажмите {self._activation_key_label()}.",
-                "pending",
-            )
-            if had_action:
-                self._set_runtime_feedback(
-                    outcome="Команда не выполнена: активное поле изменилось",
-                    tone="error",
+    def _insert_text_into_target(
+        self,
+        text: str,
+        target: FocusTarget,
+        *,
+        is_current: Callable[[], bool] | None = None,
+    ) -> str:
+        """Insert once, using the verified native Notepad path when applicable."""
+
+        if target.focused_class_name == RICHEDIT_D2DPT_CLASS:
+            targeted_insert = getattr(self.session_editor, "insert_targeted", None)
+            targeted_backend = getattr(self, "targeted_inserter", None)
+            if not callable(targeted_insert) or targeted_backend is None:
+                raise TextInsertionError(
+                    "Verified Notepad insertion is unavailable",
+                    partial=False,
+                    reason_code="targeted_inserter_unavailable",
                 )
-            return
-        automatic_spacing = self.settings_store.get().automatic_spacing
-        insertion_text = self._automatic_spacing_payload(
+            if is_current is None:
+                result = targeted_insert(text, target, targeted_backend)
+            else:
+                result = targeted_insert(
+                    text,
+                    target,
+                    targeted_backend,
+                    is_current=is_current,
+                )
+            if result.status is SessionEditorStatus.EXECUTED:
+                return result.backend
+            raise TextInsertionError(
+                f"Verified Notepad insertion failed: {result.reason_code}",
+                partial=result.status
+                in {SessionEditorStatus.FAILED, SessionEditorStatus.UNCERTAIN},
+                reason_code=result.reason_code,
+            )
+
+        self.inserter.insert(
             text,
-            target_focus,
-            enabled=automatic_spacing,
+            before_batch=lambda: self.focus_inspector.compare_current(target)
+            is FocusMatch.SAME,
         )
-        insertion_started = time.monotonic()
+        return "sendinput_unicode"
+
+    def _targeted_insertion_is_current(self, generation: int) -> bool:
+        return bool(
+            not self._closing
+            and generation == self._generation
+            and self.state is AppState.PROCESSING
+            and self._processing_stage == "targeted_insert"
+        )
+
+    def _start_targeted_insert(
+        self,
+        text: str,
+        target: FocusTarget,
+        generation: int,
+        on_ready: Callable[[str | None, TextInsertionError | None, bool], None],
+    ) -> None:
+        """Run the potentially blocking Notepad/UIA route outside Tk."""
+
+        self._processing_stage = "targeted_insert"
+        threading.Thread(
+            target=self._targeted_insert_worker,
+            args=(text, target, generation, on_ready),
+            name="targeted-text-insert",
+            daemon=True,
+        ).start()
+        self.root.after(
+            int(TARGETED_INSERT_TIMEOUT_SECONDS * 1000),
+            lambda: self._targeted_insert_timeout(generation),
+        )
+
+    def _targeted_insert_worker(
+        self,
+        text: str,
+        target: FocusTarget,
+        generation: int,
+        on_ready: Callable[[str | None, TextInsertionError | None, bool], None],
+    ) -> None:
+        backend: str | None = None
+        failure: TextInsertionError | None = None
+        unknown_failure = False
         try:
-            self.inserter.insert(insertion_text)
+            backend = self._insert_text_into_target(
+                text,
+                target,
+                is_current=lambda: self._targeted_insertion_is_current(generation),
+            )
         except TextInsertionError as exc:
-            had_action = self._pending_dictation_action is not None
-            self._clear_pending_dictation_action()
-            self._clear_automatic_spacing_context()
-            self._insertion_uncertain = exc.partial
-            if exc.partial:
+            failure = exc
+        except Exception:
+            unknown_failure = True
+        if not self._targeted_insertion_is_current(generation):
+            return
+        self.post(
+            lambda: self._targeted_insert_ready_if_current(
+                generation,
+                on_ready,
+                backend,
+                failure,
+                unknown_failure,
+            )
+        )
+
+    def _targeted_insert_ready_if_current(
+        self,
+        generation: int,
+        on_ready: Callable[[str | None, TextInsertionError | None, bool], None],
+        backend: str | None,
+        failure: TextInsertionError | None,
+        unknown_failure: bool,
+    ) -> None:
+        if not self._targeted_insertion_is_current(generation):
+            return
+        on_ready(backend, failure, unknown_failure)
+
+    def _targeted_insert_timeout(self, generation: int) -> None:
+        if not self._targeted_insertion_is_current(generation):
+            return
+        # Invalidate the worker before it can enter its final native guard. If
+        # the native call already happened, the outcome is deliberately unknown
+        # and repeating the text is blocked until the user explicitly cancels.
+        self._generation += 1
+        self._clear_pending_dictation_action()
+        self._clear_automatic_spacing_context()
+        self._tracked_session_insertion = None
+        self._last_session_edit = None
+        self._insertion_uncertain = True
+        self._update_pending_insert(
+            "targeted_insert_timeout",
+            uncertain=True,
+        )
+        self._set_state(AppState.PENDING_INSERT, "результат вставки не подтверждён")
+        self._show_status(
+            "Проверка вставки заняла слишком долго. Не повторяйте текст вслепую; он доступен в меню.",
+            "error",
+            5000,
+        )
+        self._set_runtime_feedback(
+            outcome="Результат вставки не подтверждён: превышено время ожидания",
+            tone="error",
+        )
+        self.logger.event(
+            "text_insertion_failed",
+            operation="richedit_targeted",
+            code="targeted_insert_timeout",
+        )
+
+    def _sendinput_verification_is_current(self, generation: int) -> bool:
+        return bool(
+            not self._closing
+            and generation == self._generation
+            and self.state is AppState.PROCESSING
+            and self._processing_stage == "sendinput_verify"
+        )
+
+    def _start_sendinput_verification(
+        self,
+        text: str,
+        target: FocusTarget,
+        generation: int,
+        on_ready: Callable[[SessionEditorResult], None],
+        *,
+        operation: str,
+    ) -> None:
+        """Read back a SendInput result outside Tk before claiming success."""
+
+        self._processing_stage = "sendinput_verify"
+        threading.Thread(
+            target=self._sendinput_verification_worker,
+            args=(text, target, generation, on_ready),
+            name="sendinput-postcheck",
+            daemon=True,
+        ).start()
+        self.root.after(
+            int(SENDINPUT_VERIFY_TIMEOUT_SECONDS * 1000),
+            lambda: self._sendinput_verification_timeout(
+                generation,
+                operation=operation,
+            ),
+        )
+
+    def _sendinput_verification_worker(
+        self,
+        text: str,
+        target: FocusTarget,
+        generation: int,
+        on_ready: Callable[[SessionEditorResult], None],
+    ) -> None:
+        inserter = getattr(self.session_editor, "insert_verified", None)
+        try:
+            if not callable(inserter):
+                result = SessionEditorResult(
+                    SessionEditorStatus.UNAVAILABLE,
+                    "verified_inserter_unavailable",
+                    backend="uia_text+sendinput_verified",
+                )
+            else:
+                result = inserter(
+                    text,
+                    target,
+                    is_current=lambda: self._sendinput_verification_is_current(
+                        generation
+                    ),
+                )
+                if not isinstance(result, SessionEditorResult):
+                    result = SessionEditorResult(
+                        SessionEditorStatus.UNCERTAIN,
+                        "insertion_verification_failed",
+                        backend="uia_text+sendinput_verified",
+                    )
+        except Exception:
+            result = SessionEditorResult(
+                SessionEditorStatus.UNCERTAIN,
+                "insertion_verification_failed",
+                backend="uia_text+sendinput_verified",
+            )
+        if not self._sendinput_verification_is_current(generation):
+            return
+        self.post(
+            lambda: self._sendinput_verification_ready_if_current(
+                generation,
+                on_ready,
+                result,
+            )
+        )
+
+    def _sendinput_verification_ready_if_current(
+        self,
+        generation: int,
+        on_ready: Callable[[SessionEditorResult], None],
+        result: SessionEditorResult,
+    ) -> None:
+        if not self._sendinput_verification_is_current(generation):
+            return
+        on_ready(result)
+
+    def _sendinput_postcheck_failed(
+        self,
+        reason_code: str,
+        *,
+        generation: int,
+        operation: str,
+    ) -> None:
+        had_action = self._pending_dictation_action is not None
+        self._clear_pending_dictation_action()
+        self._clear_automatic_spacing_context()
+        self._tracked_session_insertion = None
+        self._last_session_edit = None
+        self._insertion_uncertain = True
+        self._update_pending_insert(reason_code, uncertain=True)
+        self._set_state(AppState.PENDING_INSERT, "результат вставки не подтверждён")
+        self._show_status(
+            "Windows получил ввод, но поле не подтвердило текст. Не повторяйте его вслепую; полный текст доступен в меню.",
+            "error",
+            5000,
+        )
+        self._set_runtime_feedback(
+            outcome="Результат вставки не подтверждён; текст сохранён в памяти сессии",
+            tone="error",
+        )
+        self.logger.event(
+            "text_insertion_failed",
+            operation=operation,
+            code=reason_code,
+        )
+        if had_action:
+            self._set_runtime_feedback(
+                outcome="Команда не выполнена: результат вставки текста не подтверждён",
+                tone="error",
+            )
+        self._emit_quick_test_event(
+            generation=generation,
+            kind="dictation",
+            status="failed",
+            operation="verify_insert",
+            reason_code=reason_code,
+            backend="uia_text_postcheck",
+        )
+
+    def _sendinput_verification_timeout(
+        self,
+        generation: int,
+        *,
+        operation: str,
+    ) -> None:
+        if not self._sendinput_verification_is_current(generation):
+            return
+        # A SendInput side effect may already have happened. Invalidate any
+        # late worker and keep repeat disabled until the user explicitly clears
+        # the uncertainty.
+        self._generation += 1
+        self._sendinput_postcheck_failed(
+            "sendinput_postcheck_timeout",
+            generation=self._generation,
+            operation=operation,
+        )
+
+    def _dictation_insertion_failed(
+        self,
+        failure: TextInsertionError | None,
+        *,
+        unknown_failure: bool,
+    ) -> None:
+        had_action = self._pending_dictation_action is not None
+        self._clear_pending_dictation_action()
+        self._clear_automatic_spacing_context()
+        if failure is not None and not unknown_failure:
+            self._insertion_uncertain = failure.partial
+            self._update_pending_insert(
+                failure.reason_code or "text_insertion_failed",
+                uncertain=failure.partial,
+            )
+            if failure.partial:
                 self._tracked_session_insertion = None
                 self._last_session_edit = None
             self._set_state(AppState.PENDING_INSERT, "текст ждёт вставки")
             message = (
                 "Вставка могла быть частичной. Полный текст доступен в меню до выхода."
-                if exc.partial
+                if failure.partial
                 else f"Текст не вставлен. Поставьте курсор в другое поле и нажмите {self._activation_key_label()}."
             )
-            self._show_status(message, "error", 5000 if exc.partial else None)
+            self._show_status(
+                message,
+                "error",
+                5000 if failure.partial else None,
+            )
+            self.logger.event(
+                "text_insertion_failed",
+                operation="sendinput_unicode",
+                code=failure.reason_code or "text_insertion_failed",
+            )
             if had_action:
                 self._set_runtime_feedback(
                     outcome="Команда не выполнена: текст не вставлен полностью",
                     tone="error",
                 )
-            return
-        except Exception:
-            had_action = self._pending_dictation_action is not None
-            self._clear_pending_dictation_action()
-            self._clear_automatic_spacing_context()
-            self._insertion_uncertain = True
-            self._tracked_session_insertion = None
-            self._last_session_edit = None
-            self._set_state(AppState.PENDING_INSERT, "текст ждёт вставки")
-            self._show_status(
-                "Неизвестно, вставился ли текст полностью. Полный текст доступен в меню до выхода.",
-                "error",
-                5000,
+            self._emit_quick_test_event(
+                generation=self._generation,
+                kind="dictation",
+                status="failed" if failure.partial else "rejected",
+                operation="insert",
+                reason_code=failure.reason_code or "text_insertion_failed",
             )
-            if had_action:
-                self._set_runtime_feedback(
-                    outcome="Команда не выполнена: результат вставки неизвестен",
-                    tone="error",
-                )
+            if not failure.partial and self._active_quick_test() is not None:
+                self.clear_session_text()
             return
+
+        self._insertion_uncertain = True
+        self._update_pending_insert(
+            "insertion_result_unknown",
+            uncertain=True,
+        )
+        self._tracked_session_insertion = None
+        self._last_session_edit = None
+        self._set_state(AppState.PENDING_INSERT, "текст ждёт вставки")
+        self._show_status(
+            "Неизвестно, вставился ли текст полностью. Полный текст доступен в меню до выхода.",
+            "error",
+            5000,
+        )
+        self.logger.event(
+            "text_insertion_failed",
+            operation="sendinput_unicode",
+            code="insertion_result_unknown",
+        )
+        if had_action:
+            self._set_runtime_feedback(
+                outcome="Команда не выполнена: результат вставки неизвестен",
+                tone="error",
+            )
+        self._emit_quick_test_event(
+            generation=self._generation,
+            kind="dictation",
+            status="failed",
+            operation="insert",
+            reason_code="insertion_result_unknown",
+        )
+
+    def _complete_dictation_insertion(
+        self,
+        *,
+        text: str,
+        language: str,
+        probability: float,
+        generation: int,
+        insertion_text: str,
+        target_focus: FocusTarget,
+        automatic_spacing: bool,
+        insertion_started: float,
+        insertion_backend: str,
+        insertion_verified: bool = True,
+    ) -> None:
+        insertion_duration_ms = round(
+            (time.monotonic() - insertion_started) * 1000
+        )
         self.logger.event(
             "text_insertion_completed",
-            operation="sendinput_unicode",
-            duration_ms=round((time.monotonic() - insertion_started) * 1000),
+            operation=insertion_backend,
+            code="verified" if insertion_verified else "guarded_unverified",
+            duration_ms=insertion_duration_ms,
         )
+        self._clear_pending_insert()
         self._remember_successful_insertion(
             text,
             target_focus,
             enabled=automatic_spacing,
         )
-        assert target_focus is not None
-        self._tracked_session_insertion = _TrackedSessionInsertion(
-            insertion_text,
-            target_focus,
-            time.monotonic(),
-            insertion_text[: len(insertion_text) - len(text)]
-            if text and insertion_text.endswith(text)
-            else "",
+        self._tracked_session_insertion = (
+            _TrackedSessionInsertion(
+                insertion_text,
+                target_focus,
+                time.monotonic(),
+                insertion_text[: len(insertion_text) - len(text)]
+                if text and insertion_text.endswith(text)
+                else "",
+            )
+            if insertion_verified
+            else None
         )
         self._last_session_edit = None
         self.logger.event(
@@ -2151,6 +2972,28 @@ class VoiceTypeApp:
         self._clear_pending_dictation_action()
         if pending_action is not None and pending_action[0] == generation:
             _action_generation, request, action_label = pending_action
+            if not insertion_verified:
+                # A field without UIA TextPattern can still accept ordinary
+                # keyboard input, but VoiceType cannot prove the resulting
+                # text. Never press Enter/send after such an insertion.
+                self._set_state(AppState.IDLE, "готов")
+                self._show_status(
+                    "✓ Текст отправлен · Enter не нажат: поле не подтвердило вставку",
+                    "warning",
+                    4000,
+                )
+                self._set_runtime_feedback(
+                    text=text,
+                    command=action_label,
+                    outcome="Текст отправлен; конечная команда безопасно пропущена",
+                    tone="warning",
+                )
+                self.logger.event(
+                    "dictation_end_action_skipped",
+                    operation=request.intent.value,
+                    code="insertion_not_readable",
+                )
+                return
             self._set_runtime_feedback(
                 text=text,
                 command=action_label,
@@ -2162,17 +3005,330 @@ class VoiceTypeApp:
                 operation=request.intent.value,
                 code="after_successful_insert",
             )
-            self._start_control_request(request, generation)
+            self._start_control_request(
+                request,
+                generation,
+                expected_target=target_focus,
+            )
             return
         self._set_state(AppState.IDLE, "готов")
         confidence = f"{probability:.0%}" if probability >= 0 else ""
         self._show_status(
-            f"✓ Вставлено · {language.upper()} {confidence}", "success", 1500
+            (
+                f"✓ Вставлено · {language.upper()} {confidence}"
+                if insertion_verified
+                else f"✓ Текст отправлен · {language.upper()} {confidence}"
+            ),
+            "success",
+            1500,
         )
-        self.logger.event("text_inserted", state=self.state.value)
+        self._set_runtime_feedback(
+            text=text,
+            command="",
+            outcome=(
+                "Текст вставлен и проверен"
+                if insertion_verified
+                else "Текст отправлен в активное поле"
+            ),
+            tone="success",
+        )
+        self.logger.event(
+            "text_inserted",
+            state=self.state.value,
+            code="verified" if insertion_verified else "guarded_unverified",
+        )
+        self._emit_quick_test_event(
+            generation=generation,
+            kind="dictation",
+            status="passed" if insertion_verified else "failed",
+            operation="insert",
+            reason_code=("ok" if insertion_verified else "text_pattern_unavailable"),
+            backend=insertion_backend,
+            duration_ms=insertion_duration_ms,
+        )
+
+    def _targeted_dictation_insert_ready(
+        self,
+        backend: str | None,
+        failure: TextInsertionError | None,
+        unknown_failure: bool,
+        *,
+        text: str,
+        language: str,
+        probability: float,
+        generation: int,
+        insertion_text: str,
+        target_focus: FocusTarget,
+        automatic_spacing: bool,
+        insertion_started: float,
+    ) -> None:
+        if failure is not None or unknown_failure or backend is None:
+            self._dictation_insertion_failed(
+                failure,
+                unknown_failure=unknown_failure or backend is None,
+            )
+            return
+        self._complete_dictation_insertion(
+            text=text,
+            language=language,
+            probability=probability,
+            generation=generation,
+            insertion_text=insertion_text,
+            target_focus=target_focus,
+            automatic_spacing=automatic_spacing,
+            insertion_started=insertion_started,
+            insertion_backend=backend,
+        )
+
+    def _sendinput_dictation_verified(
+        self,
+        result: SessionEditorResult,
+        *,
+        text: str,
+        language: str,
+        probability: float,
+        generation: int,
+        insertion_text: str,
+        target_focus: FocusTarget,
+        automatic_spacing: bool,
+        insertion_started: float,
+    ) -> None:
+        if result.status is not SessionEditorStatus.EXECUTED:
+            if result.status is SessionEditorStatus.UNCERTAIN:
+                self._sendinput_postcheck_failed(
+                    result.reason_code,
+                    generation=generation,
+                    operation="sendinput_unicode+uia_delta_verify",
+                )
+            else:
+                self._dictation_insertion_failed(
+                    TextInsertionError(
+                        "Verified insertion was rejected before any side effect",
+                        partial=False,
+                        reason_code=result.reason_code,
+                    ),
+                    unknown_failure=False,
+                )
+            return
+        self._complete_dictation_insertion(
+            text=text,
+            language=language,
+            probability=probability,
+            generation=generation,
+            insertion_text=insertion_text,
+            target_focus=target_focus,
+            automatic_spacing=automatic_spacing,
+            insertion_started=insertion_started,
+            insertion_backend=f"sendinput_unicode+{result.backend}",
+            insertion_verified=(result.reason_code == "ok"),
+        )
+
+    def _final_text_ready(
+        self, text: str, language: str, probability: float, generation: int
+    ) -> None:
+        if generation != self._generation or self.state != AppState.PROCESSING:
+            return
+        if text == "":
+            self._target_focus = None
+            self._clear_pending_dictation_action()
+            self._clear_pending_insert()
+            self._insertion_uncertain = False
+            self._set_state(AppState.IDLE, "готов")
+            self._show_status(
+                "После обработки текста не осталось — ничего не изменено",
+                "cancelled",
+                2500,
+            )
+            self._set_runtime_feedback(
+                text="",
+                command="",
+                outcome="Ничего не вставлено: после обработки текста не осталось",
+                tone="cancelled",
+            )
+            return
+        self.last_text = text
+        self._set_runtime_feedback(text=text)
+        self._insertion_uncertain = False
+        self._update_menu()
+        target_focus = self._target_focus
+        self._target_focus = None
+        focus_match = self.focus_inspector.compare_current(target_focus)
+        if focus_match is not FocusMatch.SAME:
+            had_action = self._pending_dictation_action is not None
+            self._clear_pending_dictation_action()
+            self._clear_automatic_spacing_context()
+            focus_comparison = getattr(
+                self.focus_inspector,
+                "last_comparison",
+                None,
+            )
+            detailed_reason = getattr(
+                getattr(focus_comparison, "unknown_reason", None),
+                "value",
+                None,
+            )
+            focus_reason = (
+                f"focus_{detailed_reason}"
+                if focus_match is FocusMatch.UNKNOWN and detailed_reason
+                else f"focus_{focus_match.value}"
+            )
+            comparison_attempts = max(
+                1,
+                int(getattr(focus_comparison, "attempts", 1)),
+            )
+            self._set_pending_insert(text, target_focus, focus_reason)
+            self._set_state(AppState.PENDING_INSERT, "текст ждёт вставки")
+            self._show_status(
+                f"Текст сохранён · поставьте курсор и нажмите {self._activation_key_label()} — вставить сюда · Esc — отменить.",
+                "pending",
+            )
+            self.logger.event(
+                "text_insertion_failed",
+                operation="focus_validation",
+                code=focus_reason,
+                retry_count=comparison_attempts - 1,
+            )
+            if had_action:
+                self._set_runtime_feedback(
+                    outcome="Команда не выполнена: активное поле изменилось",
+                    tone="error",
+                )
+            quick_test_active = self._active_quick_test() is not None
+            self._emit_quick_test_event(
+                generation=generation,
+                kind="dictation",
+                status="rejected",
+                operation="insert",
+                reason_code=focus_reason,
+            )
+            if quick_test_active:
+                # A quick check must never leave an invisible pending insert
+                # that a later hotkey press could place into another window.
+                self.clear_session_text()
+            return
+        automatic_spacing = self.settings_store.get().automatic_spacing
+        insertion_text = self._automatic_spacing_payload(
+            text,
+            target_focus,
+            enabled=automatic_spacing,
+        )
+        assert target_focus is not None
+        self._set_pending_insert(
+            insertion_text,
+            target_focus,
+            "insert_in_progress",
+        )
+        insertion_started = time.monotonic()
+        if target_focus.focused_class_name == RICHEDIT_D2DPT_CLASS:
+            self._start_targeted_insert(
+                insertion_text,
+                target_focus,
+                generation,
+                lambda backend, failure, unknown_failure: self._targeted_dictation_insert_ready(
+                    backend,
+                    failure,
+                    unknown_failure,
+                    text=text,
+                    language=language,
+                    probability=probability,
+                    generation=generation,
+                    insertion_text=insertion_text,
+                    target_focus=target_focus,
+                    automatic_spacing=automatic_spacing,
+                    insertion_started=insertion_started,
+                ),
+            )
+            return
+        self._start_sendinput_verification(
+            insertion_text,
+            target_focus,
+            generation,
+            lambda result: self._sendinput_dictation_verified(
+                result,
+                text=text,
+                language=language,
+                probability=probability,
+                generation=generation,
+                insertion_text=insertion_text,
+                target_focus=target_focus,
+                automatic_spacing=automatic_spacing,
+                insertion_started=insertion_started,
+            ),
+            operation="sendinput_unicode",
+        )
+        self._show_processing_status()
+
+    @staticmethod
+    def _same_virtual_input_surface(
+        expected: FocusTarget | None,
+        current: FocusTarget | None,
+    ) -> bool:
+        """Recognize one unchanged browser/Electron HWND without UIA text."""
+
+        if expected is None or current is None:
+            return False
+        if not expected.stable or not current.stable:
+            return False
+        if not (
+            expected.has_complete_win32_identity
+            and current.has_complete_win32_identity
+        ):
+            return False
+        identity = (
+            "foreground_hwnd",
+            "root_hwnd",
+            "focused_hwnd",
+            "thread_id",
+            "process_id",
+        )
+        if any(
+            int(getattr(expected, field)) != int(getattr(current, field))
+            for field in identity
+        ):
+            return False
+        old_class = expected.focused_class_name.strip().casefold()
+        new_class = current.focused_class_name.strip().casefold()
+        if not old_class or old_class != new_class:
+            return False
+        # Do not infer a virtual editor merely because the class is not one of
+        # a short list of native controls. Chromium and Electron use this
+        # explicit top-level class for DOM-backed fields.
+        return old_class.startswith("chrome_widgetwin_")
+
+    def _refresh_target_focus_at_stop(self) -> None:
+        """Refresh a recreated Chromium target at the user's stop boundary.
+
+        The second activation press is the last explicit user action selecting
+        where ordinary dictation belongs. After this point `_final_text_ready`
+        again requires the exact UIA RuntimeId, so a later click or DOM focus
+        move cannot redirect text or an end action to another field.
+        """
+
+        expected = self._target_focus
+        if expected is None:
+            return
+        try:
+            current = self.focus_inspector.capture()
+        except Exception:
+            return
+        if expected.compare(current) is FocusMatch.SAME:
+            self._target_focus = current
+            return
+        if not self._same_virtual_input_surface(expected, current):
+            return
+        if expected.uia_runtime_id is None or current.uia_runtime_id is None:
+            return
+        self._target_focus = current
+        self.logger.event(
+            "dictation_target_refreshed",
+            operation="stop_activation_boundary",
+            code="virtual_runtime_id_changed",
+        )
 
     def cancel(self) -> None:
+        self._pending_repeat_waiting = False
         self._clear_pending_dictation_action()
+        self._quick_test_cycle_active = False
         if self.state in {AppState.STARTING, AppState.RECORDING}:
             self._cancel_timer()
             self._generation += 1
@@ -2210,6 +3366,30 @@ class VoiceTypeApp:
                     "error",
                     3500,
                 )
+            elif processing_stage in {"targeted_insert", "sendinput_verify"}:
+                self._tracked_session_insertion = None
+                self._last_session_edit = None
+                self._insertion_uncertain = True
+                self._update_pending_insert(
+                    (
+                        "targeted_insert_cancelled"
+                        if processing_stage == "targeted_insert"
+                        else "sendinput_postcheck_cancelled"
+                    ),
+                    uncertain=True,
+                )
+                self._clear_automatic_spacing_context()
+                self._clear_pending_control()
+                self._hide_number_overlay()
+                self._set_state(
+                    AppState.PENDING_INSERT,
+                    "результат вставки не подтверждён",
+                )
+                self._show_status(
+                    "Проверка вставки отменена; не повторяйте текст вслепую.",
+                    "error",
+                    3500,
+                )
             else:
                 self._clear_pending_control()
                 self._hide_number_overlay()
@@ -2218,6 +3398,7 @@ class VoiceTypeApp:
             self.logger.event("processing_cancelled", operation=processing_stage)
         elif self.state == AppState.PENDING_INSERT:
             self._target_focus = None
+            self._clear_pending_insert()
             self._set_state(AppState.IDLE, "готов")
             self._show_status(
                 "Ожидание вставки отменено. Последний текст остался в меню.",
@@ -2228,6 +3409,10 @@ class VoiceTypeApp:
             self._clear_pending_control()
             self._hide_number_overlay()
             self._show_status("Голосовая команда отменена", "cancelled", 1600)
+        else:
+            quick_test_window = self._active_quick_test()
+            if quick_test_window is not None:
+                quick_test_window.close()
 
     def _restart_transcriber_worker(self, old_transcriber: OfflineTranscriber) -> None:
         old_transcriber.close()
@@ -2254,11 +3439,260 @@ class VoiceTypeApp:
         self.transcriber = replacement
         self._model_ready()
 
-    def repeat_last(self) -> None:
+    def _complete_repeat_insertion(
+        self,
+        *,
+        was_pending: bool,
+        target_focus: FocusTarget,
+        inserted_text: str,
+        operation: str,
+        insertion_verified: bool = True,
+    ) -> None:
+        self._set_state(AppState.IDLE, "готов")
+        if was_pending:
+            automatic_prefix = (
+                inserted_text[: len(inserted_text) - len(self.last_text)]
+                if self.last_text and inserted_text.endswith(self.last_text)
+                else ""
+            )
+            self._tracked_session_insertion = (
+                _TrackedSessionInsertion(
+                    inserted_text,
+                    target_focus,
+                    time.monotonic(),
+                    automatic_prefix,
+                )
+                if insertion_verified
+                else None
+            )
+            self._remember_successful_insertion(
+                self.last_text,
+                target_focus,
+                enabled=self.settings_store.get().automatic_spacing,
+            )
+            self._set_runtime_feedback(
+                outcome=(
+                    "Сохранённый текст вставлен; голосовое редактирование доступно"
+                    if insertion_verified
+                    else "Сохранённый текст отправлен в активное поле"
+                ),
+                tone="success",
+            )
+        else:
+            # An ordinary duplicate repeat has no ownership proof relative to
+            # the previous copy, so semantic editing remains disabled for it.
+            self._tracked_session_insertion = None
+        self._last_session_edit = None
+        self._insertion_uncertain = False
+        self._clear_pending_insert()
+        self.logger.event(
+            "text_insertion_completed",
+            operation=operation,
+            code="verified" if insertion_verified else "guarded_unverified",
+        )
+        self._show_status(
+            (
+                "✓ Последний текст вставлен"
+                if insertion_verified
+                else "✓ Последний текст отправлен"
+            ),
+            "success",
+            1500,
+        )
+
+    def _targeted_repeat_insert_ready(
+        self,
+        backend: str | None,
+        failure: TextInsertionError | None,
+        unknown_failure: bool,
+        *,
+        was_pending: bool,
+        target_focus: FocusTarget,
+        inserted_text: str,
+    ) -> None:
+        if failure is not None and not unknown_failure:
+            self._insertion_uncertain = failure.partial
+            if was_pending:
+                self._update_pending_insert(
+                    failure.reason_code or "repeat_insert_failed",
+                    uncertain=failure.partial,
+                )
+            self.logger.event(
+                "text_insertion_failed",
+                operation="pending_reinsert_targeted"
+                if was_pending
+                else "repeat_insert_targeted",
+                code=failure.reason_code or "repeat_insert_failed",
+            )
+            if failure.partial:
+                self._tracked_session_insertion = None
+                self._last_session_edit = None
+                self._set_state(
+                    AppState.PENDING_INSERT,
+                    "результат вставки не подтверждён",
+                )
+                self._show_status(
+                    "Вставка могла быть частичной. Используйте «Скопировать последний текст».",
+                    "error",
+                    4000,
+                )
+            else:
+                self._set_state(
+                    AppState.PENDING_INSERT if was_pending else AppState.IDLE,
+                    "текст ждёт вставки" if was_pending else "готов",
+                )
+                self._show_status(
+                    f"Не удалось вставить. Выберите другое поле и снова нажмите {self._activation_key_label()}."
+                    if was_pending
+                    else "Повторная вставка заблокирована",
+                    "pending" if was_pending else "error",
+                    None if was_pending else 4000,
+                )
+            return
+        if unknown_failure or backend is None:
+            self._insertion_uncertain = True
+            if was_pending:
+                self._update_pending_insert(
+                    "repeat_insert_unknown",
+                    uncertain=True,
+                )
+            self.logger.event(
+                "text_insertion_failed",
+                operation="pending_reinsert_targeted"
+                if was_pending
+                else "repeat_insert_targeted",
+                code="repeat_insert_unknown",
+            )
+            self._tracked_session_insertion = None
+            self._last_session_edit = None
+            self._set_state(
+                AppState.PENDING_INSERT,
+                "результат вставки не подтверждён",
+            )
+            self._show_status(
+                "Неизвестно, вставился ли текст полностью. Используйте копирование из меню.",
+                "error",
+                4000,
+            )
+            return
+
+        self._complete_repeat_insertion(
+            was_pending=was_pending,
+            target_focus=target_focus,
+            inserted_text=inserted_text,
+            operation=(
+                "pending_reinsert_targeted"
+                if was_pending
+                else "repeat_insert_targeted"
+            ),
+        )
+
+    def _sendinput_repeat_verified(
+        self,
+        result: SessionEditorResult,
+        *,
+        was_pending: bool,
+        target_focus: FocusTarget,
+        inserted_text: str,
+        generation: int,
+    ) -> None:
+        operation = (
+            "pending_reinsert_sendinput_unicode+uia_delta_verify"
+            if was_pending
+            else "repeat_insert_sendinput_unicode+uia_delta_verify"
+        )
+        if result.status is not SessionEditorStatus.EXECUTED:
+            if result.status is SessionEditorStatus.UNCERTAIN:
+                self._sendinput_postcheck_failed(
+                    result.reason_code,
+                    generation=generation,
+                    operation=operation,
+                )
+            else:
+                self._insertion_uncertain = False
+                if was_pending:
+                    self._update_pending_insert(
+                        result.reason_code,
+                        uncertain=False,
+                    )
+                self._set_state(
+                    AppState.PENDING_INSERT if was_pending else AppState.IDLE,
+                    "текст ждёт вставки" if was_pending else "готов",
+                )
+                self._show_status(
+                    (
+                        f"Не удалось подтвердить это поле. Выберите другое поле и снова нажмите {self._activation_key_label()}."
+                        if was_pending
+                        else "Повторная вставка безопасно отклонена"
+                    ),
+                    "pending" if was_pending else "error",
+                    None if was_pending else 3500,
+                )
+                self.logger.event(
+                    "text_insertion_failed",
+                    operation=operation,
+                    code=result.reason_code,
+                )
+            return
+        self._complete_repeat_insertion(
+            was_pending=was_pending,
+            target_focus=target_focus,
+            inserted_text=inserted_text,
+            operation=f"{operation}:{result.backend}",
+            insertion_verified=(result.reason_code == "ok"),
+        )
+
+    def _activation_binding_is_held(self) -> bool:
+        checker = getattr(getattr(self, "hotkeys", None), "activation_is_held", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            # Failing closed here avoids injecting text with an unknown
+            # modifier state.  The user can still copy the saved text.
+            return True
+
+    def _repeat_pending_after_activation_release(self) -> None:
+        if (
+            self._closing
+            or self.state is not AppState.PENDING_INSERT
+            or not self.last_text
+        ):
+            self._pending_repeat_waiting = False
+            return
+        if self._activation_binding_is_held():
+            self.root.after(20, self._repeat_pending_after_activation_release)
+            return
+        self._pending_repeat_waiting = False
+        self.repeat_last(_wait_for_activation_release=False)
+
+    def repeat_last(self, *, _wait_for_activation_release: bool = True) -> None:
+        if self.state not in {AppState.IDLE, AppState.PENDING_INSERT}:
+            self._show_status(
+                "Сначала завершите текущую запись или обработку текста.",
+                "processing",
+                2200,
+            )
+            return
         if not self.last_text:
             self._show_status("Последнего текста пока нет", "cancelled", 1600)
             return
         pending = self.state == AppState.PENDING_INSERT
+        if (
+            pending
+            and _wait_for_activation_release
+            and self._activation_binding_is_held()
+        ):
+            if not self._pending_repeat_waiting:
+                self._pending_repeat_waiting = True
+                self._show_status(
+                    f"Отпустите {self._activation_key_label()} — сохранённый текст вставится после отпускания.",
+                    "pending",
+                )
+                self.root.after(20, self._repeat_pending_after_activation_release)
+            return
+        self._pending_repeat_waiting = False
         if self._insertion_uncertain:
             self._show_status(
                 "Повтор заблокирован: предыдущая вставка могла быть частичной. Используйте «Скопировать последний текст».",
@@ -2266,42 +3700,81 @@ class VoiceTypeApp:
                 4000,
             )
             return
+        if self._pending_control_request is not None or self.number_overlay.snapshot_id:
+            self._clear_pending_control()
+            self._hide_number_overlay()
         # A manual repeat has no verified start-of-dictation focus snapshot, so
         # it must not participate in automatic spacing for the next dictation.
         self._clear_automatic_spacing_context()
-        try:
-            self.inserter.insert(self.last_text)
-        except TextInsertionError as exc:
-            self._insertion_uncertain = exc.partial
+        target_focus = self.focus_inspector.capture()
+        if not target_focus.stable or not target_focus.has_complete_win32_identity:
             if pending:
-                message = (
-                    "Вставка могла быть частичной. Используйте «Скопировать последний текст»."
-                    if exc.partial
-                    else f"Не удалось вставить. Выберите другое поле и снова нажмите {self._activation_key_label()}."
+                self._update_pending_insert(
+                    "retry_focus_unstable",
+                    uncertain=False,
                 )
-                self._show_status(message, "error" if exc.partial else "pending", 4000 if exc.partial else None)
-            else:
-                self._show_status("Повторная вставка заблокирована", "error", 4000)
+            self.logger.event(
+                "text_insertion_failed",
+                operation="pending_reinsert_focus"
+                if pending
+                else "repeat_insert_focus",
+                code="retry_focus_unstable",
+            )
+            self._show_status(
+                "Не удалось надёжно определить поле. Поставьте курсор и повторите.",
+                "pending",
+                3000,
+            )
             return
-        except Exception:
-            self._insertion_uncertain = True
-            if pending:
-                self._show_status(
-                    "Неизвестно, вставился ли текст полностью. Используйте копирование из меню.",
-                    "error",
-                    4000,
-                )
-            else:
-                self._show_status("Повторная вставка заблокирована", "error", 4000)
+        # A saved service prefix (normally one automatic leading space) was
+        # calculated for the old caret position.  FocusTarget identifies the
+        # field, not its current caret, so a manual retry must use the semantic
+        # transcript and never replay that potentially stale prefix.
+        insertion_text = self.last_text
+        if target_focus.focused_class_name == RICHEDIT_D2DPT_CLASS:
+            self._generation += 1
+            generation = self._generation
+            self._processing_started_at = time.monotonic()
+            self._processing_stage = "targeted_insert"
+            self._set_state(AppState.PROCESSING, "проверяю вставку")
+            self._show_processing_status()
+            self._start_targeted_insert(
+                insertion_text,
+                target_focus,
+                generation,
+                lambda backend, failure, unknown_failure: self._targeted_repeat_insert_ready(
+                    backend,
+                    failure,
+                    unknown_failure,
+                    was_pending=pending,
+                    target_focus=target_focus,
+                    inserted_text=insertion_text,
+                ),
+            )
             return
-        if pending:
-            self._set_state(AppState.IDLE, "готов")
-        # A manual repeat has no start-of-dictation focus proof. Do not let a
-        # later semantic edit guess which repeated copy owns the caret.
-        self._tracked_session_insertion = None
-        self._last_session_edit = None
-        self._insertion_uncertain = False
-        self._show_status("✓ Последний текст вставлен", "success", 1500)
+        self._generation += 1
+        generation = self._generation
+        self._processing_started_at = time.monotonic()
+        self._processing_stage = "sendinput_verify"
+        self._set_state(AppState.PROCESSING, "проверяю вставку")
+        self._show_processing_status()
+        self._start_sendinput_verification(
+            insertion_text,
+            target_focus,
+            generation,
+            lambda result: self._sendinput_repeat_verified(
+                result,
+                was_pending=pending,
+                target_focus=target_focus,
+                inserted_text=insertion_text,
+                generation=generation,
+            ),
+            operation=(
+                "pending_reinsert_sendinput_unicode"
+                if pending
+                else "repeat_insert_sendinput_unicode"
+            ),
+        )
 
     def copy_last(self) -> None:
         if not self.last_text:
@@ -2311,6 +3784,8 @@ class VoiceTypeApp:
         self.root.clipboard_append(self.last_text)
         self.root.update_idletasks()
         if self.state == AppState.PENDING_INSERT:
+            self._pending_repeat_waiting = False
+            self._clear_pending_insert()
             self._set_state(AppState.IDLE, "готов")
             self._show_status(
                 "Последний текст скопирован; можно начать новую диктовку",
@@ -2330,11 +3805,13 @@ class VoiceTypeApp:
         self._show_status("Исходный текст скопирован", "success", 1500)
 
     def clear_session_text(self) -> None:
-        session_edit_in_flight = (
+        self._pending_repeat_waiting = False
+        side_effect_in_flight = (
             self.state is AppState.PROCESSING
-            and self._processing_stage == "session_edit"
+            and self._processing_stage
+            in {"session_edit", "targeted_insert", "sendinput_verify"}
         )
-        if session_edit_in_flight:
+        if side_effect_in_flight:
             # Invalidate the worker before releasing its tracked text. A UIA
             # provider may already be inside a native call, so the document
             # result is deliberately treated as uncertain even though a late
@@ -2353,21 +3830,22 @@ class VoiceTypeApp:
             command="",
             outcome=(
                 "Текст сессии очищен; результат незавершённого редактирования в поле не подтверждён"
-                if session_edit_in_flight
+                if side_effect_in_flight
                 else "Текст текущей сессии очищен"
             ),
-            tone="warning" if session_edit_in_flight else "success",
+            tone="warning" if side_effect_in_flight else "success",
         )
-        self._insertion_uncertain = session_edit_in_flight
+        self._insertion_uncertain = side_effect_in_flight
+        self._clear_pending_insert()
         self._tracked_session_insertion = None
         self._last_session_edit = None
         self._clear_automatic_spacing_context()
         if self.state == AppState.PENDING_INSERT:
             self._set_state(AppState.IDLE, "готов")
         self._update_menu()
-        if session_edit_in_flight:
+        if side_effect_in_flight:
             self._show_status(
-                "Текст сессии очищен; результат редактирования в поле не подтверждён",
+                "Текст сессии очищен; результат операции в поле не подтверждён",
                 "warning",
                 3500,
             )
@@ -2436,6 +3914,12 @@ class VoiceTypeApp:
         if memory_window is not None:
             try:
                 memory_window.close()
+            except Exception:
+                pass
+        quick_test_window = getattr(self, "_quick_test_window", None)
+        if quick_test_window is not None:
+            try:
+                quick_test_window.close(clear_session=False)
             except Exception:
                 pass
         cleanup = threading.Thread(
@@ -2523,6 +4007,8 @@ def run_ui_smoke(smoke_timeout_ms: int = 1200) -> None:
     store = MemoryStore(Path(temporary.name) / "memory.sqlite3")
     settings_window: SettingsWindow | None = None
     memory_window: MemoryWindow | None = None
+    quick_test_window: QuickTestWindow | None = None
+    quick_test_snapshot = QuickTestSessionSnapshot(0, 0, None)
     closed = False
 
     def close_all() -> None:
@@ -2536,6 +4022,11 @@ def run_ui_smoke(smoke_timeout_ms: int = 1200) -> None:
                     window.close()
                 except Exception:
                     pass
+        if quick_test_window is not None:
+            try:
+                quick_test_window.close(clear_session=False)
+            except Exception:
+                pass
         root.quit()
 
     def show_memory() -> None:
@@ -2545,6 +4036,68 @@ def run_ui_smoke(smoke_timeout_ms: int = 1200) -> None:
         if settings_window is not None:
             settings_window.close()
         memory_window = open_memory_window(root, store)
+
+    def show_quick_test() -> None:
+        nonlocal quick_test_window
+        if closed:
+            return
+        if memory_window is not None:
+            memory_window.close()
+        quick_test_window = open_quick_test_window(
+            root,
+            language="auto",
+            activation_label="правый Ctrl",
+            start_generation=0,
+            snapshot_provider=lambda: quick_test_snapshot,
+            on_reset_session=lambda: None,
+        )
+        root.after(100, lambda: drive_quick_test(0))
+
+    def drive_quick_test(step_index: int) -> None:
+        nonlocal quick_test_snapshot
+        window = quick_test_window
+        if closed or window is None:
+            return
+        baseline = "Первое предложение. Второе предложение."
+        field_values = (
+            baseline,
+            "Первое предложение.",
+            baseline,
+            "Первое предложение. Проверка завершена.",
+        )
+        operations = (
+            "insert",
+            "delete_last_sentence",
+            "restore_last_edit",
+            "replace_last_sentence",
+        )
+        kinds = (
+            "dictation",
+            "session_edit",
+            "session_edit",
+            "session_edit",
+        )
+        generation = step_index + 1
+        value = field_values[step_index]
+        window.native_field.set_text(value)
+        quick_test_snapshot = QuickTestSessionSnapshot(
+            generation,
+            window.native_field.hwnd,
+            value,
+        )
+        window.handle_event(
+            QuickTestEvent(
+                sequence=generation,
+                generation=generation,
+                kind=kinds[step_index],
+                status="passed",
+                operation=operations[step_index],
+                reason_code="ok",
+                backend="ui_smoke",
+            )
+        )
+        if step_index < 3:
+            root.after(90, lambda: drive_quick_test(step_index + 1))
 
     try:
         overlay.show("VoiceType Local — UI smoke", "ready", 250)
@@ -2556,7 +4109,8 @@ def run_ui_smoke(smoke_timeout_ms: int = 1200) -> None:
             delete_secret=lambda: None,
         )
         root.after(250, show_memory)
-        root.after(max(700, int(smoke_timeout_ms)), close_all)
+        root.after(500, show_quick_test)
+        root.after(max(950, int(smoke_timeout_ms)), close_all)
         root.mainloop()
     finally:
         close_all()

@@ -52,6 +52,14 @@ def test_protected_tokens_cover_numbers_urls_emails_codes_and_terms() -> None:
     assert tokens["AB-123"] == 1
 
 
+def test_protected_tokens_deduplicate_detectors_not_real_occurrences() -> None:
+    tokens = protected_tokens(
+        "https://example.com затем https://example.com",
+    )
+
+    assert tokens["https://example.com"] == 2
+
+
 def test_conservative_validation_rejects_changed_number() -> None:
     assert not validate_conservative_change("Цена 15 евро", "Цена 50 евро")
 

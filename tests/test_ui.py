@@ -4,7 +4,9 @@ from collections.abc import Callable
 from types import SimpleNamespace
 
 import voicetype_local.ui as ui_module
+from voicetype_local.session_editing import SessionEditCommandParser
 from voicetype_local.ui import StatusOverlay, TrayController
+from voicetype_local.voice_commands import ParseDisposition, VoiceCommandParser
 
 
 class _Label:
@@ -93,6 +95,55 @@ def test_overlay_invalid_preferences_fail_closed_and_position_is_applied(
         "top",
     )
     assert positions[-1][3:5] == (28, 300)
+
+
+def test_every_mixed_mode_help_example_repeats_its_command_prefix() -> None:
+    sections = {
+        "Русский": (
+            "Примеры режима «Обычный» — префикс повторяется перед каждой командой:\n",
+            "команда ",
+            "ru",
+        ),
+        "Español": (
+            "Ejemplos del modo Normal; el prefijo se repite en cada orden:\n",
+            "comando ",
+            "es",
+        ),
+        "English": (
+            "Everyday-mode examples; repeat the prefix before every command:\n",
+            "command ",
+            "en",
+        ),
+    }
+    edit_parser = SessionEditCommandParser()
+    command_parser = VoiceCommandParser()
+
+    for language, (marker, prefix, command_language) in sections.items():
+        content = ui_module._COMMAND_HELP[language]
+        examples = content.split(marker, 1)[1].split("\n\n", 1)[0]
+        phrases = [
+            phrase.strip()
+            for line in examples.splitlines()
+            for phrase in line.split(" · ")
+        ]
+
+        assert phrases
+        assert all(phrase.casefold().startswith(prefix) for phrase in phrases)
+        for phrase in phrases:
+            edit = edit_parser.parse(
+                phrase,
+                mode="mixed",
+                language=command_language,
+            )
+            command = command_parser.parse(
+                phrase,
+                mode="mixed",
+                language=command_language,
+            )
+            assert (
+                edit.request is not None
+                or command.disposition is ParseDisposition.COMMAND
+            )
 
 
 def _tray(*, on_settings: Callable[[], None] | None) -> TrayController:

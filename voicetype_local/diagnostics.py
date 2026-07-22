@@ -42,6 +42,7 @@ ALLOWED_EVENTS = {
     "dictation_cycle_completed",
     "dictation_end_action_started",
     "text_insertion_completed",
+    "text_insertion_failed",
     "processing_cancelled",
     "recording_start_failed",
     "recording_start_requested",

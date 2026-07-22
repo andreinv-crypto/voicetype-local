@@ -122,11 +122,21 @@ _LANGUAGE_ORDER: Final[tuple[CommandLanguage, ...]] = (
     CommandLanguage.ES,
 )
 
-_RU_POLITE_PREFIX: Final[re.Pattern[str]] = re.compile(
-    r"^\s*пожалуйста(?:\s+|\s*[,.;:!?…—–-]+\s*)(?P<body>.+?)\s*$",
-    re.IGNORECASE,
-)
-_RU_GRAMMAR_SEPARATOR: Final[str] = r"(?:\s+|\s*[,.;:!?…—–-]+\s*)"
+_GRAMMAR_SEPARATOR: Final[str] = r"(?:\s+|\s*[,.;:!?…—–-]+\s*)"
+_POLITE_PREFIX_PATTERNS: Final[dict[CommandLanguage, re.Pattern[str]]] = {
+    CommandLanguage.RU: re.compile(
+        rf"^\s*пожалуйста{_GRAMMAR_SEPARATOR}(?P<body>.+?)\s*$",
+        re.IGNORECASE,
+    ),
+    CommandLanguage.EN: re.compile(
+        rf"^\s*please{_GRAMMAR_SEPARATOR}(?P<body>.+?)\s*$",
+        re.IGNORECASE,
+    ),
+    CommandLanguage.ES: re.compile(
+        rf"^\s*por\s+favor{_GRAMMAR_SEPARATOR}(?P<body>.+?)\s*$",
+        re.IGNORECASE,
+    ),
+}
 
 _EXACT_ACTIONS: Final[
     dict[CommandLanguage, dict[str, SessionEditAction]]
@@ -134,40 +144,58 @@ _EXACT_ACTIONS: Final[
     CommandLanguage.RU: {
         "удали последнее слово": SessionEditAction.DELETE_LAST_WORD,
         "удалить последнее слово": SessionEditAction.DELETE_LAST_WORD,
+        "удалите последнее слово": SessionEditAction.DELETE_LAST_WORD,
         "убери последнее слово": SessionEditAction.DELETE_LAST_WORD,
         "убрать последнее слово": SessionEditAction.DELETE_LAST_WORD,
+        "уберите последнее слово": SessionEditAction.DELETE_LAST_WORD,
         "удали последнее предложение": SessionEditAction.DELETE_LAST_SENTENCE,
         "удалить последнее предложение": SessionEditAction.DELETE_LAST_SENTENCE,
+        "удалите последнее предложение": SessionEditAction.DELETE_LAST_SENTENCE,
         "удали последнюю фразу": SessionEditAction.DELETE_LAST_SENTENCE,
         "удалить последнюю фразу": SessionEditAction.DELETE_LAST_SENTENCE,
+        "удалите последнюю фразу": SessionEditAction.DELETE_LAST_SENTENCE,
         "убери последнее предложение": SessionEditAction.DELETE_LAST_SENTENCE,
         "убрать последнее предложение": SessionEditAction.DELETE_LAST_SENTENCE,
+        "уберите последнее предложение": SessionEditAction.DELETE_LAST_SENTENCE,
         "убери последнюю фразу": SessionEditAction.DELETE_LAST_SENTENCE,
         "убрать последнюю фразу": SessionEditAction.DELETE_LAST_SENTENCE,
+        "уберите последнюю фразу": SessionEditAction.DELETE_LAST_SENTENCE,
         "удали последний текст": SessionEditAction.DELETE_LAST_DICTATION,
         "удалить последний текст": SessionEditAction.DELETE_LAST_DICTATION,
+        "удалите последний текст": SessionEditAction.DELETE_LAST_DICTATION,
         "убери последний текст": SessionEditAction.DELETE_LAST_DICTATION,
         "убрать последний текст": SessionEditAction.DELETE_LAST_DICTATION,
+        "уберите последний текст": SessionEditAction.DELETE_LAST_DICTATION,
         "удали последнюю диктовку": SessionEditAction.DELETE_LAST_DICTATION,
         "удалить последнюю диктовку": SessionEditAction.DELETE_LAST_DICTATION,
+        "удалите последнюю диктовку": SessionEditAction.DELETE_LAST_DICTATION,
         "убери последнюю диктовку": SessionEditAction.DELETE_LAST_DICTATION,
         "убрать последнюю диктовку": SessionEditAction.DELETE_LAST_DICTATION,
+        "уберите последнюю диктовку": SessionEditAction.DELETE_LAST_DICTATION,
         "верни последнее исправление": SessionEditAction.RESTORE_LAST_EDIT,
         "вернуть последнее исправление": SessionEditAction.RESTORE_LAST_EDIT,
         "верни последнее изменение": SessionEditAction.RESTORE_LAST_EDIT,
         "вернуть последнее изменение": SessionEditAction.RESTORE_LAST_EDIT,
         "верни последнюю правку": SessionEditAction.RESTORE_LAST_EDIT,
         "вернуть последнюю правку": SessionEditAction.RESTORE_LAST_EDIT,
+        "верните последнее исправление": SessionEditAction.RESTORE_LAST_EDIT,
+        "верните последнее изменение": SessionEditAction.RESTORE_LAST_EDIT,
+        "верните последнюю правку": SessionEditAction.RESTORE_LAST_EDIT,
         "отмени последнее исправление": SessionEditAction.RESTORE_LAST_EDIT,
         "отменить последнее исправление": SessionEditAction.RESTORE_LAST_EDIT,
         "восстанови последнее исправление": SessionEditAction.RESTORE_LAST_EDIT,
         "восстановить последнее исправление": SessionEditAction.RESTORE_LAST_EDIT,
         "восстанови последнее изменение": SessionEditAction.RESTORE_LAST_EDIT,
         "восстановить последнее изменение": SessionEditAction.RESTORE_LAST_EDIT,
+        "восстановите последнее исправление": SessionEditAction.RESTORE_LAST_EDIT,
+        "восстановите последнее изменение": SessionEditAction.RESTORE_LAST_EDIT,
         "отмени последнее изменение": SessionEditAction.RESTORE_LAST_EDIT,
         "отменить последнее изменение": SessionEditAction.RESTORE_LAST_EDIT,
         "отмени последнюю правку": SessionEditAction.RESTORE_LAST_EDIT,
         "отменить последнюю правку": SessionEditAction.RESTORE_LAST_EDIT,
+        "отмените последнее исправление": SessionEditAction.RESTORE_LAST_EDIT,
+        "отмените последнее изменение": SessionEditAction.RESTORE_LAST_EDIT,
+        "отмените последнюю правку": SessionEditAction.RESTORE_LAST_EDIT,
     },
     CommandLanguage.EN: {
         "delete last word": SessionEditAction.DELETE_LAST_WORD,
@@ -184,13 +212,21 @@ _EXACT_ACTIONS: Final[
         "remove last dictation": SessionEditAction.DELETE_LAST_DICTATION,
         "remove last text": SessionEditAction.DELETE_LAST_DICTATION,
         "restore last voice edit": SessionEditAction.RESTORE_LAST_EDIT,
+        "restore the last voice edit": SessionEditAction.RESTORE_LAST_EDIT,
+        "restore last edit": SessionEditAction.RESTORE_LAST_EDIT,
+        "restore the last edit": SessionEditAction.RESTORE_LAST_EDIT,
         "undo last voice edit": SessionEditAction.RESTORE_LAST_EDIT,
+        "undo the last voice edit": SessionEditAction.RESTORE_LAST_EDIT,
+        "undo last edit": SessionEditAction.RESTORE_LAST_EDIT,
+        "undo the last edit": SessionEditAction.RESTORE_LAST_EDIT,
     },
     CommandLanguage.ES: {
         "borra la ultima palabra": SessionEditAction.DELETE_LAST_WORD,
         "borrar la ultima palabra": SessionEditAction.DELETE_LAST_WORD,
         "elimina la ultima palabra": SessionEditAction.DELETE_LAST_WORD,
         "eliminar la ultima palabra": SessionEditAction.DELETE_LAST_WORD,
+        "borre la ultima palabra": SessionEditAction.DELETE_LAST_WORD,
+        "elimine la ultima palabra": SessionEditAction.DELETE_LAST_WORD,
         "borra la ultima frase": SessionEditAction.DELETE_LAST_SENTENCE,
         "borrar la ultima frase": SessionEditAction.DELETE_LAST_SENTENCE,
         "borrar la ultima oracion": SessionEditAction.DELETE_LAST_SENTENCE,
@@ -198,6 +234,11 @@ _EXACT_ACTIONS: Final[
         "elimina la ultima frase": SessionEditAction.DELETE_LAST_SENTENCE,
         "eliminar la ultima frase": SessionEditAction.DELETE_LAST_SENTENCE,
         "eliminar la ultima oracion": SessionEditAction.DELETE_LAST_SENTENCE,
+        "elimina la ultima oracion": SessionEditAction.DELETE_LAST_SENTENCE,
+        "borre la ultima frase": SessionEditAction.DELETE_LAST_SENTENCE,
+        "borre la ultima oracion": SessionEditAction.DELETE_LAST_SENTENCE,
+        "elimine la ultima frase": SessionEditAction.DELETE_LAST_SENTENCE,
+        "elimine la ultima oracion": SessionEditAction.DELETE_LAST_SENTENCE,
         "borra el ultimo dictado": SessionEditAction.DELETE_LAST_DICTATION,
         "borrar el ultimo dictado": SessionEditAction.DELETE_LAST_DICTATION,
         "elimina el ultimo dictado": SessionEditAction.DELETE_LAST_DICTATION,
@@ -205,17 +246,77 @@ _EXACT_ACTIONS: Final[
         "borra el ultimo texto": SessionEditAction.DELETE_LAST_DICTATION,
         "borrar el ultimo texto": SessionEditAction.DELETE_LAST_DICTATION,
         "eliminar el ultimo texto": SessionEditAction.DELETE_LAST_DICTATION,
+        "borre el ultimo dictado": SessionEditAction.DELETE_LAST_DICTATION,
+        "borre el ultimo texto": SessionEditAction.DELETE_LAST_DICTATION,
+        "elimine el ultimo dictado": SessionEditAction.DELETE_LAST_DICTATION,
+        "elimine el ultimo texto": SessionEditAction.DELETE_LAST_DICTATION,
         "deshaz la ultima correccion": SessionEditAction.RESTORE_LAST_EDIT,
         "deshacer la ultima correccion": SessionEditAction.RESTORE_LAST_EDIT,
         "restaura la ultima correccion": SessionEditAction.RESTORE_LAST_EDIT,
         "restaurar la ultima correccion": SessionEditAction.RESTORE_LAST_EDIT,
+        "restaure la ultima correccion": SessionEditAction.RESTORE_LAST_EDIT,
+        "deshaz la ultima edicion": SessionEditAction.RESTORE_LAST_EDIT,
+        "restaura la ultima edicion": SessionEditAction.RESTORE_LAST_EDIT,
+        "restaure la ultima edicion": SessionEditAction.RESTORE_LAST_EDIT,
     },
 }
 
 _EDIT_STARTS: Final[dict[CommandLanguage, tuple[str, ...]]] = {
-    CommandLanguage.RU: ("удали ", "удалить ", "убери ", "убрать ", "замени ", "заменить ", "поменяй ", "поменять ", "исправь ", "исправить ", "верни ", "вернуть ", "восстанови ", "восстановить ", "отмени ", "отменить "),
-    CommandLanguage.EN: ("delete ", "remove ", "replace ", "change ", "correct ", "restore ", "undo "),
-    CommandLanguage.ES: ("borra ", "borrar ", "elimina ", "eliminar ", "reemplaza ", "reemplazar ", "cambia ", "cambiar ", "corrige ", "corregir ", "deshaz ", "restaura "),
+    CommandLanguage.RU: (
+        "удали ",
+        "удалить ",
+        "удалите ",
+        "убери ",
+        "убрать ",
+        "уберите ",
+        "замени ",
+        "заменить ",
+        "замените ",
+        "поменяй ",
+        "поменять ",
+        "поменяйте ",
+        "исправь ",
+        "исправить ",
+        "исправьте ",
+        "верни ",
+        "вернуть ",
+        "верните ",
+        "восстанови ",
+        "восстановить ",
+        "восстановите ",
+        "отмени ",
+        "отменить ",
+        "отмените ",
+    ),
+    CommandLanguage.EN: (
+        "delete ",
+        "remove ",
+        "replace ",
+        "change ",
+        "correct ",
+        "restore ",
+        "undo ",
+    ),
+    CommandLanguage.ES: (
+        "borra ",
+        "borrar ",
+        "borre ",
+        "elimina ",
+        "eliminar ",
+        "elimine ",
+        "reemplaza ",
+        "reemplazar ",
+        "reemplace ",
+        "cambia ",
+        "cambiar ",
+        "cambie ",
+        "corrige ",
+        "corregir ",
+        "corrija ",
+        "deshaz ",
+        "restaura ",
+        "restaure ",
+    ),
 }
 
 _REPLACE_LAST_PATTERNS: Final[
@@ -224,49 +325,49 @@ _REPLACE_LAST_PATTERNS: Final[
     CommandLanguage.RU: (
         (
             re.compile(
-                rf"^\s*(?:замени|заменить|поменяй|поменять|исправь|исправить){_RU_GRAMMAR_SEPARATOR}последнее\s+слово\s+на{_RU_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$",
+                rf"^\s*(?:замени|заменить|замените|поменяй|поменять|поменяйте|исправь|исправить|исправьте){_GRAMMAR_SEPARATOR}последнее\s+слово\s+на{_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$",
                 re.I,
             ),
             SessionEditAction.REPLACE_LAST_WORD,
         ),
         (
             re.compile(
-                rf"^\s*(?:замени|заменить|поменяй|поменять|исправь|исправить){_RU_GRAMMAR_SEPARATOR}(?:последнее\s+предложение|последнюю\s+фразу)\s+на{_RU_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$",
+                rf"^\s*(?:замени|заменить|замените|поменяй|поменять|поменяйте|исправь|исправить|исправьте){_GRAMMAR_SEPARATOR}(?:последнее\s+предложение|последнюю\s+фразу)\s+на{_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$",
                 re.I,
             ),
             SessionEditAction.REPLACE_LAST_SENTENCE,
         ),
         (
             re.compile(
-                rf"^\s*(?:замени|заменить|исправь|исправить){_RU_GRAMMAR_SEPARATOR}(?:последний\s+текст|последнюю\s+диктовку)\s+на{_RU_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$",
+                rf"^\s*(?:замени|заменить|замените|исправь|исправить|исправьте){_GRAMMAR_SEPARATOR}(?:последний\s+текст|последнюю\s+диктовку)\s+на{_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$",
                 re.I,
             ),
             SessionEditAction.REPLACE_LAST_DICTATION,
         ),
     ),
     CommandLanguage.EN: (
-        (re.compile(r"^\s*(?:replace|change|correct)\s+(?:the\s+)?last\s+word\s+with\s+(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_WORD),
-        (re.compile(r"^\s*(?:replace|change|correct)\s+(?:the\s+)?last\s+sentence\s+with\s+(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_SENTENCE),
-        (re.compile(r"^\s*(?:replace|change|correct)\s+(?:the\s+)?last\s+(?:dictation|text)\s+with\s+(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_DICTATION),
+        (re.compile(rf"^\s*(?:replace|change|correct){_GRAMMAR_SEPARATOR}(?:the\s+)?last\s+word\s+with{_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_WORD),
+        (re.compile(rf"^\s*(?:replace|change|correct){_GRAMMAR_SEPARATOR}(?:the\s+)?last\s+sentence\s+with{_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_SENTENCE),
+        (re.compile(rf"^\s*(?:replace|change|correct){_GRAMMAR_SEPARATOR}(?:the\s+)?last\s+(?:dictation|text)\s+with{_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_DICTATION),
     ),
     CommandLanguage.ES: (
-        (re.compile(r"^\s*(?:reemplaza|reemplazar|cambia|cambiar|corrige|corregir)\s+la\s+[úu]ltima\s+palabra\s+(?:por|con)\s+(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_WORD),
-        (re.compile(r"^\s*(?:reemplaza|reemplazar|cambia|cambiar|corrige|corregir)\s+la\s+[úu]ltima\s+(?:frase|oraci[oó]n)\s+(?:por|con)\s+(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_SENTENCE),
-        (re.compile(r"^\s*(?:reemplaza|reemplazar|cambia|cambiar|corrige|corregir)\s+el\s+[úu]ltimo\s+(?:dictado|texto)\s+(?:por|con)\s+(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_DICTATION),
+        (re.compile(rf"^\s*(?:reemplaza|reemplazar|reemplace|cambia|cambiar|cambie|corrige|corregir|corrija){_GRAMMAR_SEPARATOR}la\s+[úu]ltima\s+palabra\s+(?:por|con){_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_WORD),
+        (re.compile(rf"^\s*(?:reemplaza|reemplazar|reemplace|cambia|cambiar|cambie|corrige|corregir|corrija){_GRAMMAR_SEPARATOR}la\s+[úu]ltima\s+(?:frase|oraci[oó]n)\s+(?:por|con){_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_SENTENCE),
+        (re.compile(rf"^\s*(?:reemplaza|reemplazar|reemplace|cambia|cambiar|cambie|corrige|corregir|corrija){_GRAMMAR_SEPARATOR}el\s+[úu]ltimo\s+(?:dictado|texto)\s+(?:por|con){_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$", re.I), SessionEditAction.REPLACE_LAST_DICTATION),
     ),
 }
 
 _REPLACE_UNIQUE_PATTERNS: Final[dict[CommandLanguage, re.Pattern[str]]] = {
     CommandLanguage.RU: re.compile(
-        rf"^\s*(?:замени|заменить){_RU_GRAMMAR_SEPARATOR}(?:в\s+последн(?:ем|ей)\s+(?:тексте|диктовке)\s+)?(?P<old>.+?)\s+на{_RU_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$",
+        rf"^\s*(?:замени|заменить|замените){_GRAMMAR_SEPARATOR}(?:в\s+последн(?:ем|ей)\s+(?:тексте|диктовке)\s+)?(?P<old>.+?)\s+на{_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$",
         re.I,
     ),
     CommandLanguage.EN: re.compile(
-        r"^\s*replace(?:\s+in\s+(?:the\s+)?last\s+(?:text|dictation))?\s+(?P<old>.+?)\s+with\s+(?P<new>.+?)\s*$",
+        rf"^\s*replace(?:{_GRAMMAR_SEPARATOR}in\s+(?:the\s+)?last\s+(?:text|dictation))?{_GRAMMAR_SEPARATOR}(?P<old>.+?)\s+with{_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$",
         re.I,
     ),
     CommandLanguage.ES: re.compile(
-        r"^\s*(?:reemplaza|reemplazar)(?:\s+en\s+el\s+[úu]ltimo\s+(?:texto|dictado))?\s+(?P<old>.+?)\s+(?:por|con)\s+(?P<new>.+?)\s*$",
+        rf"^\s*(?:reemplaza|reemplazar|reemplace)(?:{_GRAMMAR_SEPARATOR}en\s+el\s+[úu]ltimo\s+(?:texto|dictado))?{_GRAMMAR_SEPARATOR}(?P<old>.+?)\s+(?:por|con){_GRAMMAR_SEPARATOR}(?P<new>.+?)\s*$",
         re.I,
     ),
 }
@@ -324,11 +425,11 @@ class SessionEditCommandParser:
         else:
             body = text
 
-        # A single polite lead-in is accepted only after the explicit Russian
-        # command prefix.  A repeated or unprefixed "пожалуйста" never widens
-        # the grammar and therefore cannot turn ordinary dictation into an edit.
-        if prefixed is not None and prefix_language is CommandLanguage.RU:
-            polite = _RU_POLITE_PREFIX.fullmatch(body)
+        # A single language-matched polite lead-in is accepted only after an
+        # explicit command prefix.  Repeated or unprefixed politeness never
+        # widens the grammar and cannot turn ordinary dictation into an edit.
+        if prefixed is not None:
+            polite = _POLITE_PREFIX_PATTERNS[prefix_language].fullmatch(body)
             if polite is not None:
                 body = polite.group("body")
 

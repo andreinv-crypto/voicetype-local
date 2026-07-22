@@ -112,6 +112,14 @@ class ActivationKeyDetector:
             for event_name in self._held_inputs
         )
 
+    def binding_is_held(self) -> bool:
+        """Return whether any key belonging to this activation is still down."""
+
+        with self._lock:
+            return self._primary_held or (
+                self.modifier is not None and self._modifier_is_held()
+            )
+
     def press(self, event_name: str) -> bool:
         callback: Callable[[], None] | None = None
         with self._lock:
@@ -288,6 +296,11 @@ class GlobalHotkeyListener:
 
     def is_alive(self) -> bool:
         return self._listener is not None and self._listener.is_alive()
+
+    def activation_is_held(self) -> bool:
+        """Thread-safe state used to delay text injection until key-up."""
+
+        return self._detector.binding_is_held()
 
     def stop(self) -> None:
         if self._listener is not None:

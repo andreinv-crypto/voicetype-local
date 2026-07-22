@@ -308,21 +308,23 @@ class NumberOverlay:
 _COMMAND_HELP = {
     "Русский": (
         "Режим «Диктовка»: печатается только текст.\n"
-        "Режим «Управление»: говорите команду сразу.\n"
+        "Режим «Управление»: префикс «команда» можно опустить.\n"
         "Режим «Обычный» (смешанный): текст печатается; любую команду "
         "начинайте со слова «команда».\n"
-        "В конце текста можно сказать «нажать Enter» или «отправить сообщение».\n\n"
-        "помощь · покажи номера · нажми номер 7\n"
-        "открой Блокнот · переключись на Chrome\n"
-        "сверни окно · разверни окно\n"
-        "прокрути вниз · нажми на Настройки\n"
-        "нажми клавиши контрол си\n"
-        "повтори последнее · скопируй последнее\n"
-        "команда удали последнее слово · удали последнее предложение\n"
+        "Исключение: после уже продиктованного текста можно добавить «нажать Enter» "
+        "или «отправить сообщение».\n\n"
+        "Примеры режима «Обычный» — префикс повторяется перед каждой командой:\n"
+        "команда помощь · команда покажи номера · команда нажми номер 7\n"
+        "команда открой Блокнот · команда переключись на Chrome\n"
+        "команда сверни окно · команда разверни окно\n"
+        "команда прокрути вниз · команда нажми на Настройки\n"
+        "команда нажми клавиши контрол си\n"
+        "команда повтори последнее · команда скопируй последнее\n"
+        "команда удали последнее слово · команда удали последнее предложение\n"
         "команда замени черновик на готовый текст\n"
         "команда замени последнее предложение на Готово.\n"
         "команда верни последнее исправление\n"
-        "отмена · подтверждаю\n\n"
+        "команда отмена · команда подтверждаю\n\n"
         "Правка работает только с последней подтверждённой вставкой VoiceType "
         "в том же поле и при неизменённом курсоре. Замена выполняется, только "
         "если фраза найдена ровно один раз.\n\n"
@@ -331,19 +333,20 @@ _COMMAND_HELP = {
     ),
     "Español": (
         "Modo Dictado: solo se escribe texto.\n"
-        "Modo Control: diga la orden directamente.\n"
+        "Modo Control: el prefijo «comando» es opcional.\n"
         "Modo Normal (mixto): el texto se escribe; empiece cualquier orden con «comando».\n"
-        "Al final del texto puede decir «pulsa Intro» o «enviar mensaje».\n\n"
-        "ayuda · muestra los números · haz clic en el número 7\n"
-        "abre Bloc de notas · cambia a Chrome\n"
-        "minimiza la ventana · maximiza la ventana\n"
-        "desplaza hacia abajo · pulsa Configuración\n"
-        "pulsa Control C · repite lo último · copia lo último\n"
-        "comando borra la última palabra · borra la última frase\n"
+        "Excepción: después de texto dictado puede añadir «pulsa Intro» o «enviar mensaje».\n\n"
+        "Ejemplos del modo Normal; el prefijo se repite en cada orden:\n"
+        "comando ayuda · comando muestra los números · comando haz clic en el número 7\n"
+        "comando abre Bloc de notas · comando cambia a Chrome\n"
+        "comando minimiza la ventana · comando maximiza la ventana\n"
+        "comando desplaza hacia abajo · comando pulsa Configuración\n"
+        "comando pulsa Control C · comando repite lo último · comando copia lo último\n"
+        "comando borra la última palabra · comando borra la última frase\n"
         "comando reemplaza prueba por resultado\n"
         "comando reemplaza la última frase por Listo.\n"
         "comando restaura la última corrección\n"
-        "cancelar · confirmo\n\n"
+        "comando cancelar · comando confirmo\n\n"
         "La edición solo toca la última inserción verificada de VoiceType en el "
         "mismo campo y con el cursor intacto. La sustitución exige una sola coincidencia.\n\n"
         "Delete/Retroceso, enviar, Intro y otras acciones sensibles requieren confirmación. Terminal, UAC y "
@@ -351,19 +354,20 @@ _COMMAND_HELP = {
     ),
     "English": (
         "Dictation mode: only text is typed.\n"
-        "Control mode: say the command directly.\n"
+        "Control mode: the “command” prefix is optional.\n"
         "Everyday (mixed) mode: text is typed; begin any command with “command”.\n"
-        "At the end of text, say “press Enter” or “send message”.\n\n"
-        "help · show numbers · click number 7\n"
-        "open Notepad · switch to Chrome\n"
-        "minimize window · maximize window\n"
-        "scroll down · click Settings\n"
-        "press Control C · repeat last · copy last\n"
-        "command delete last word · delete last sentence\n"
+        "Exception: after dictated text, append “press Enter” or “send message”.\n\n"
+        "Everyday-mode examples; repeat the prefix before every command:\n"
+        "command help · command show numbers · command click number 7\n"
+        "command open Notepad · command switch to Chrome\n"
+        "command minimize window · command maximize window\n"
+        "command scroll down · command click Settings\n"
+        "command press Control C · command repeat last · command copy last\n"
+        "command delete last word · command delete last sentence\n"
         "command replace test with result\n"
         "command replace last sentence with Done.\n"
         "command restore last voice edit\n"
-        "cancel · confirm\n\n"
+        "command cancel · command confirm\n\n"
         "Editing only touches VoiceType’s last verified insertion in the same "
         "field with an unchanged caret. Replacement requires exactly one match.\n\n"
         "Delete/Backspace, sending, Enter and other sensitive actions require confirmation. Terminal, UAC and administrator "
@@ -410,13 +414,30 @@ class CommandHelpWindow:
             frame = ttk.Frame(notebook, padding=18)
             tabs[title] = frame
             notebook.add(frame, text=title)
-            ttk.Label(
+            frame.columnconfigure(0, weight=1)
+            frame.rowconfigure(0, weight=1)
+            help_text = tk.Text(
                 frame,
-                text=content,
                 font=("Segoe UI", 13),
-                justify="left",
-                wraplength=660,
-            ).pack(anchor="nw", fill="x")
+                wrap="word",
+                relief="flat",
+                borderwidth=0,
+                highlightthickness=0,
+                padx=4,
+                pady=4,
+                takefocus=True,
+            )
+            scrollbar = ttk.Scrollbar(
+                frame,
+                orient="vertical",
+                command=help_text.yview,
+                takefocus=True,
+            )
+            help_text.configure(yscrollcommand=scrollbar.set)
+            help_text.insert("1.0", content)
+            help_text.configure(state="disabled", cursor="arrow")
+            help_text.grid(row=0, column=0, sticky="nsew")
+            scrollbar.grid(row=0, column=1, sticky="ns", padx=(8, 0))
         preferred = {"ru": "Русский", "es": "Español", "en": "English"}.get(
             language, "Русский"
         )

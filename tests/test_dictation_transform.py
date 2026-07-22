@@ -61,6 +61,77 @@ def test_spanish_accented_phrases_are_supported() -> None:
 
 
 @pytest.mark.parametrize(
+    ("text", "language", "expected"),
+    (
+        (
+            "Привет, запятая, мир. Новая строка. Дальше.",
+            "ru",
+            "Привет, мир.\nДальше.",
+        ),
+        (
+            "Hello, comma, world. New paragraph. Next.",
+            "en",
+            "Hello, world.\n\nNext.",
+        ),
+        (
+            "Hola, coma, mundo. Nueva línea. Siguiente.",
+            "es",
+            "Hola, mundo.\nSiguiente.",
+        ),
+    ),
+)
+def test_attached_asr_punctuation_does_not_duplicate_spoken_formatting(
+    text: str,
+    language: str,
+    expected: str,
+) -> None:
+    assert transform_dictation(text, language=language).text == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "language", "expected", "commands"),
+    (
+        (
+            "A таб B двоеточие C точка с запятой D",
+            "ru",
+            "A\tB: C; D",
+            (DictationCommand.TAB, DictationCommand.COLON, DictationCommand.SEMICOLON),
+        ),
+        (
+            "A new line B question mark C exclamation point D",
+            "en",
+            "A\nB? C! D",
+            (
+                DictationCommand.NEW_LINE,
+                DictationCommand.QUESTION_MARK,
+                DictationCommand.EXCLAMATION_MARK,
+            ),
+        ),
+        (
+            "A tabulación B punto C signo de exclamación D",
+            "es",
+            "A\tB. C! D",
+            (
+                DictationCommand.TAB,
+                DictationCommand.PERIOD,
+                DictationCommand.EXCLAMATION_MARK,
+            ),
+        ),
+    ),
+)
+def test_remaining_ru_en_es_formatting_phrases_are_verified(
+    text: str,
+    language: str,
+    expected: str,
+    commands: tuple[DictationCommand, ...],
+) -> None:
+    result = transform_dictation(text, language=language)
+
+    assert result.text == expected
+    assert tuple(item.command for item in result.applied_commands) == commands
+
+
+@pytest.mark.parametrize(
     ("text", "expected", "command"),
     [
         ("один двоеточие два", "один: два", DictationCommand.COLON),

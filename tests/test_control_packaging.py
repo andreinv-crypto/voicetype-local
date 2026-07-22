@@ -29,8 +29,20 @@ def _fake_modules() -> dict[str, object]:
             SessionEditCommandParser=object
         ),
         "voicetype_local.session_editor": SimpleNamespace(SessionTextEditor=object),
+        "voicetype_local.targeted_inserter": SimpleNamespace(
+            TargetedRichEditInserter=object,
+            Win32RichEditMessageBackend=object,
+        ),
+        "voicetype_local.test_lab": SimpleNamespace(
+            NativeRichEditField=object,
+            QuickTestSession=object,
+            QuickTestWindow=object,
+        ),
         "voicetype_local.windows_session_editor_probe": SimpleNamespace(
             run_isolated_session_editor_probe=lambda: (0, "ok")
+        ),
+        "voicetype_local.windows_targeted_inserter_probe": SimpleNamespace(
+            run_isolated_targeted_inserter_probe=lambda: (0, "ok")
         ),
     }
 
@@ -84,6 +96,9 @@ def test_pyinstaller_and_scripts_include_control_runtime() -> None:
     entrypoint = (ROOT / "voicetype_local" / "__main__.py").read_text(
         encoding="utf-8"
     )
+    app_source = (ROOT / "voicetype_local" / "app.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "uiautomation==2.0.29" in requirements.splitlines()
     assert "collect_all('uiautomation')" in spec
@@ -98,6 +113,13 @@ def test_pyinstaller_and_scripts_include_control_runtime() -> None:
     assert entrypoint.index("run_packaged_control_self_test") < entrypoint.index(
         "AudioRecorder.input_devices"
     )
+    assert entrypoint.index(
+        "run_isolated_targeted_inserter_probe"
+    ) < entrypoint.index("AudioRecorder.input_devices")
+    assert app_source.index(
+        "self.targeted_inserter = TargetedRichEditInserter()"
+    ) < app_source.index("self.session_editor = SessionTextEditor(")
+    assert "targeted_inserter=self.targeted_inserter" in app_source
 
 
 def test_packaging_preflight_contains_no_desktop_actions() -> None:

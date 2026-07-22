@@ -210,6 +210,24 @@ def test_hold_starts_on_primary_down_and_stops_on_primary_release() -> None:
     assert events == ["start", "stop"]
 
 
+def test_binding_is_held_until_primary_and_modifier_are_both_released() -> None:
+    detector = ActivationKeyDetector(
+        lambda: None,
+        key_name="ctrl+f8",
+        activation_mode="toggle",
+    )
+
+    detector.press("ctrl:162")
+    detector.press("f8")
+    assert detector.binding_is_held()
+
+    detector.release("f8")
+    assert detector.binding_is_held()
+
+    detector.release("ctrl:162")
+    assert not detector.binding_is_held()
+
+
 def test_combo_listener_suppresses_only_a_matched_primary() -> None:
     events: list[str] = []
     listener = GlobalHotkeyListener(

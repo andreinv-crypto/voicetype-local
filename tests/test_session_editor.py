@@ -13,6 +13,12 @@ from voicetype_local.session_editing import (
     plan_session_edit,
 )
 from voicetype_local.session_editor import SessionEditorStatus, SessionTextEditor
+from voicetype_local.targeted_inserter import (
+    RICHEDIT_D2DPT_CLASS,
+    TargetedInsertionResult,
+    TargetedInsertionStatus,
+    TargetedRichEditInserter,
+)
 from voicetype_local.voice_commands import CommandLanguage
 
 
@@ -1281,3 +1287,1530 @@ def test_editor_moves_caret_to_end_after_middle_replacement() -> None:
     assert result.succeeded
     assert document.text == "prefix alpha BETA-LONG gamma"
     assert document.selection == (len(document.text), len(document.text))
+
+
+def _targeted_target(
+    *,
+    class_name: str = RICHEDIT_D2DPT_CLASS,
+    runtime_id: tuple[int, ...] | None = (7, 8, 9),
+) -> FocusTarget:
+    return FocusTarget(
+        foreground_hwnd=1,
+        root_hwnd=1,
+        focused_hwnd=2,
+        thread_id=3,
+        process_id=4,
+        focused_class_name=class_name,
+        uia_runtime_id=runtime_id,
+        stable=True,
+    )
+
+
+class _TargetedTestInserter:
+    def __init__(
+        self,
+        document: _Document,
+        result: TargetedInsertionResult | None = None,
+        *,
+        apply_replacement: bool = True,
+        caret_override: tuple[int, int] | None = None,
+    ) -> None:
+        self.document = document
+        self.result = result or TargetedInsertionResult.accepted()
+        self.apply_replacement = apply_replacement
+        self.caret_override = caret_override
+        self.calls: list[tuple[str, int, str]] = []
+        self.guard_results: list[bool] = []
+
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        return TargetedRichEditInserter.normalize_text(text)
+
+    def insert(
+        self,
+        text: str,
+        *,
+        hwnd: int,
+        class_name: str,
+        before_call,
+    ) -> TargetedInsertionResult:
+        allowed = bool(before_call())
+        self.guard_results.append(allowed)
+        if not allowed:
+            return TargetedInsertionResult.rejected("guard_rejected")
+        self.calls.append((text, hwnd, class_name))
+        if (
+            self.result.status is TargetedInsertionStatus.ACCEPTED
+            and self.apply_replacement
+        ):
+            start, end = self.document.selection
+            self.document.text = (
+                self.document.text[:start] + text + self.document.text[end:]
+            )
+            caret = start + len(text)
+            self.document.selection = (caret, caret)
+            if self.caret_override is not None:
+                self.document.selection = self.caret_override
+        return self.result
+
+
+def test_targeted_insert_accepts_exact_collapsed_selection() -> None:
+    document = _Document("prefix suffix")
+    document.selection = (7, 7)
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        "новый ",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.backend == "uia_text+richedit_targeted"
+    assert document.text == "prefix новый suffix"
+    assert targeted.guard_results == [True]
+    assert targeted.calls == [("новый ", 2, RICHEDIT_D2DPT_CLASS)]
+
+
+def test_targeted_insert_replaces_one_nonempty_selection() -> None:
+    document = _Document("before OLD after")
+    document.selection = (7, 10)
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        "new\r\nline",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert document.text == "before new\nline after"
+    assert targeted.calls == [("new\nline", 2, RICHEDIT_D2DPT_CLASS)]
+
+
+def test_targeted_insert_rejects_selection_change_at_native_guard() -> None:
+    document = _Document("same same")
+    document.selection = (5, 9)
+
+    class _MovedSelectionPattern(_Pattern):
+        def __init__(self, value: _Document) -> None:
+            super().__init__(value)
+            self.calls = 0
+
+        def GetSelection(self):
+            self.calls += 1
+            if self.calls >= 2:
+                return [_Range(self.document, 0, 4)]
+            return super().GetSelection()
+
+    pattern = _MovedSelectionPattern(document)
+
+    class _PatternControl(_Control):
+        def GetTextPattern(self):
+            return pattern
+
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_PatternControl(document)),
+    )
+
+    result = editor.insert_targeted(
+        "changed",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.REJECTED
+    assert result.reason_code == "selection_changed"
+    assert targeted.guard_results == [False]
+    assert targeted.calls == []
+    assert document.text == "same same"
+
+
+def test_targeted_insert_rejects_focus_change_at_native_guard() -> None:
+    document = _Document("safe")
+
+    class _FocusChangesAtGuard:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def compare_current(self, _expected: FocusTarget) -> FocusMatch:
+            self.calls += 1
+            return FocusMatch.SAME if self.calls == 1 else FocusMatch.CHANGED
+
+    focus = _FocusChangesAtGuard()
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _Inserter(document),
+        focus,  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        " text",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.REJECTED
+    assert result.reason_code == "focus_changed"
+    assert focus.calls == 2
+    assert targeted.calls == []
+    assert document.text == "safe"
+
+
+def test_targeted_insert_rejects_invalidated_request_at_native_guard() -> None:
+    document = _Document("safe")
+    targeted = _TargetedTestInserter(document)
+    checks = 0
+
+    def is_current() -> bool:
+        nonlocal checks
+        checks += 1
+        # Initial preflight and guard entry are current; the request becomes
+        # stale while the guard performs its UIA selection/focus proof.
+        return checks < 3
+
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        " text",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+        is_current=is_current,
+    )
+
+    assert result.status is SessionEditorStatus.REJECTED
+    assert result.reason_code == "request_cancelled"
+    assert checks == 3
+    assert targeted.guard_results == [False]
+    assert targeted.calls == []
+    assert document.text == "safe"
+
+
+def test_targeted_insert_timeout_is_uncertain() -> None:
+    document = _Document("safe")
+    targeted = _TargetedTestInserter(
+        document,
+        TargetedInsertionResult.timeout(),
+    )
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        " text",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "targeted_insert_timeout"
+    assert targeted.calls == [(" text", 2, RICHEDIT_D2DPT_CLASS)]
+
+
+def test_targeted_insert_unsafe_native_rejection_is_uncertain() -> None:
+    document = _Document("safe")
+    targeted = _TargetedTestInserter(
+        document,
+        TargetedInsertionResult.rejected(
+            "message_rejected",
+            postcheck_required=True,
+            safe_to_retry=False,
+            native_error=5,
+        ),
+    )
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        " text",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "targeted_result_unknown"
+    assert targeted.calls == [(" text", 2, RICHEDIT_D2DPT_CLASS)]
+
+
+def test_targeted_insert_postcheck_mismatch_is_uncertain(monkeypatch) -> None:
+    monkeypatch.setattr("voicetype_local.session_editor.time.sleep", lambda _value: None)
+    document = _Document("safe")
+    targeted = _TargetedTestInserter(document, apply_replacement=False)
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        " text",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "targeted_postcheck_failed"
+    assert document.text == "safe"
+
+
+def test_targeted_insert_exact_text_with_wrong_caret_is_uncertain(monkeypatch) -> None:
+    monkeypatch.setattr("voicetype_local.session_editor.time.sleep", lambda _value: None)
+    document = _Document("prefix suffix")
+    document.selection = (7, 7)
+    targeted = _TargetedTestInserter(document, caret_override=(0, 0))
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        "new ",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "targeted_postcheck_failed"
+    assert document.text == "prefix new suffix"
+    assert document.selection == (0, 0)
+
+
+def test_targeted_insert_rejects_large_document_before_side_effect() -> None:
+    document = _Document("x" * 65_537)
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        "y",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.UNAVAILABLE
+    assert result.reason_code == "document_too_large"
+    assert targeted.guard_results == []
+    assert targeted.calls == []
+
+
+def test_targeted_insert_counts_non_bmp_text_as_utf16_units() -> None:
+    document = _Document("😀" * 32_769)
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        "y",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.UNAVAILABLE
+    assert result.reason_code == "document_too_large"
+    assert targeted.guard_results == []
+    assert targeted.calls == []
+
+
+def test_targeted_insert_rejects_password_runtime_and_initial_focus() -> None:
+    document = _Document("safe")
+    targeted = _TargetedTestInserter(document)
+
+    password_editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document, password=True)),
+    )
+    password = password_editor.insert_targeted(
+        " text",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    class _OtherRuntimeControl(_Control):
+        def GetRuntimeId(self):
+            return (99,)
+
+    runtime_editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_OtherRuntimeControl(document)),
+    )
+    runtime = runtime_editor.insert_targeted(
+        " text",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    focus_editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(FocusMatch.CHANGED),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+    focus = focus_editor.insert_targeted(
+        " text",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert (password.status, password.reason_code) == (
+        SessionEditorStatus.REJECTED,
+        "password_field_prohibited",
+    )
+    assert (runtime.status, runtime.reason_code) == (
+        SessionEditorStatus.REJECTED,
+        "focus_changed",
+    )
+    assert (focus.status, focus.reason_code) == (
+        SessionEditorStatus.REJECTED,
+        "focus_changed",
+    )
+    assert targeted.calls == []
+
+
+def test_targeted_insert_allows_only_exact_richedit_class() -> None:
+    document = _Document("safe")
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_targeted(
+        " text",
+        _targeted_target(class_name="richeditd2dpt"),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert result.status is SessionEditorStatus.UNAVAILABLE
+    assert result.reason_code == "targeted_class_unsupported"
+    assert targeted.calls == []
+
+
+def test_targeted_insert_requires_uia_and_text_pattern() -> None:
+    document = _Document("safe")
+    targeted = _TargetedTestInserter(document)
+    no_uia = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        None,
+    ).insert_targeted(
+        " text",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    class _NoPatternControl(_Control):
+        def GetTextPattern(self):
+            return None
+
+    no_pattern = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_NoPatternControl(document)),
+    ).insert_targeted(
+        " text",
+        _targeted_target(),
+        targeted,  # type: ignore[arg-type]
+    )
+
+    assert (no_uia.status, no_uia.reason_code) == (
+        SessionEditorStatus.UNAVAILABLE,
+        "uia_unavailable",
+    )
+    assert (no_pattern.status, no_pattern.reason_code) == (
+        SessionEditorStatus.UNAVAILABLE,
+        "text_pattern_unavailable",
+    )
+    assert targeted.calls == []
+
+
+def test_targeted_insert_shares_session_editor_operation_lock() -> None:
+    document = _Document("safe")
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+    assert editor._operation_lock.acquire(blocking=False)  # type: ignore[attr-defined]
+    try:
+        result = editor.insert_targeted(
+            " text",
+            _targeted_target(),
+            targeted,  # type: ignore[arg-type]
+        )
+    finally:
+        editor._operation_lock.release()  # type: ignore[attr-defined]
+
+    assert result.status is SessionEditorStatus.UNAVAILABLE
+    assert result.reason_code == "session_editor_busy"
+    assert targeted.calls == []
+
+
+def test_verify_insertion_confirms_exact_suffix_without_modifying_field() -> None:
+    document = _Document("Чужой текст. Точная вставка")
+    original_selection = document.selection
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.verify_insertion("Точная вставка", _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.reason_code == "ok"
+    assert result.backend == "uia_text_postcheck:suffix_exact"
+    assert document.text == "Чужой текст. Точная вставка"
+    assert document.selection == original_selection
+
+
+def test_verify_insertion_missing_text_is_uncertain(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "voicetype_local.session_editor.time.sleep",
+        lambda _value: None,
+    )
+    document = _Document("Другой текст")
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.verify_insertion("Ожидаемая вставка", _target())
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "insertion_verification_failed"
+    assert document.text == "Другой текст"
+
+
+def test_verify_insertion_polls_for_delayed_provider_update(monkeypatch) -> None:
+    document = _Document("До вставки: ")
+    sleeps = 0
+
+    def publish_update(_value: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+        document.text = "До вставки: готово"
+        document.selection = (len(document.text), len(document.text))
+
+    monkeypatch.setattr("voicetype_local.session_editor.time.sleep", publish_update)
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.verify_insertion("готово", _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.reason_code == "ok"
+    assert sleeps == 1
+    assert document.text == "До вставки: готово"
+
+
+def test_verify_insertion_rejects_changed_focus_without_reading_text() -> None:
+    document = _Document("Ожидаемая вставка")
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(FocusMatch.CHANGED),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.verify_insertion("Ожидаемая вставка", _target())
+
+    assert result.status is SessionEditorStatus.REJECTED
+    assert result.reason_code == "focus_changed"
+    assert document.text == "Ожидаемая вставка"
+
+
+def test_verify_insertion_unavailable_text_pattern_is_uncertain(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "voicetype_local.session_editor.time.sleep",
+        lambda _value: None,
+    )
+    document = _Document("Ожидаемая вставка")
+
+    class _NoPatternControl(_Control):
+        def GetTextPattern(self):
+            return None
+
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_NoPatternControl(document)),
+    )
+
+    result = editor.verify_insertion("Ожидаемая вставка", _target())
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "text_pattern_unavailable"
+    assert document.text == "Ожидаемая вставка"
+
+
+def test_verify_insertion_honours_cancellation_during_polling(monkeypatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "voicetype_local.session_editor.time.sleep",
+        lambda value: sleeps.append(value),
+    )
+    document = _Document("Текст ещё не обновился")
+    checks = 0
+
+    def is_current() -> bool:
+        nonlocal checks
+        checks += 1
+        # Initial validation and the first UIA probe are current. The request
+        # is cancelled before the second probe.
+        return checks < 3
+
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.verify_insertion(
+        "Ожидаемая вставка",
+        _target(),
+        is_current=is_current,
+    )
+
+    assert result.status is SessionEditorStatus.REJECTED
+    assert result.reason_code == "request_cancelled"
+    assert checks == 3
+    assert len(sleeps) == 1
+    assert document.text == "Текст ещё не обновился"
+
+
+def test_verify_insertion_nonblocking_lock_reports_uncertain() -> None:
+    document = _Document("Ожидаемая вставка")
+    editor = SessionTextEditor(
+        _Inserter(document),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+    assert editor._operation_lock.acquire(blocking=False)  # type: ignore[attr-defined]
+    try:
+        result = editor.verify_insertion("Ожидаемая вставка", _target())
+    finally:
+        editor._operation_lock.release()  # type: ignore[attr-defined]
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "session_editor_busy"
+    assert document.text == "Ожидаемая вставка"
+
+
+class _VerifiedInputInserter:
+    def __init__(
+        self,
+        document: _Document,
+        *,
+        chunk_size: int | None = None,
+        noop: bool = False,
+    ) -> None:
+        self.document = document
+        self.chunk_size = chunk_size
+        self.noop = noop
+        self.calls: list[str] = []
+        self.guard_results: list[bool] = []
+
+    def insert(self, text: str, *, before_batch) -> None:
+        self.calls.append(text)
+        size = self.chunk_size or max(1, len(text))
+        inserted_any = False
+        for offset in range(0, len(text), size):
+            chunk = text[offset : offset + size]
+            allowed = bool(before_batch())
+            self.guard_results.append(allowed)
+            if not allowed:
+                raise TextInsertionError(
+                    "guard rejected",
+                    partial=inserted_any,
+                    reason_code="input_guard_rejected",
+                )
+            if self.noop:
+                continue
+            start, end = self.document.selection
+            self.document.text = (
+                self.document.text[:start]
+                + chunk
+                + self.document.text[end:]
+            )
+            caret = start + len(chunk)
+            self.document.selection = (caret, caret)
+            inserted_any = True
+
+    def replace_selection(self, _text: str) -> None:
+        raise AssertionError("insert_verified must use inserter.insert")
+
+
+class _GuardedAtomicInserter:
+    """Model the one-call production inserter without hiding guard timing."""
+
+    def __init__(
+        self,
+        document: _Document,
+        *,
+        outcome: str = "success",
+        before_guard=None,
+        after_input=None,
+    ) -> None:
+        self.document = document
+        self.outcome = outcome
+        self.before_guard = before_guard
+        self.after_input = after_input
+        self.atomic_calls = 0
+        self.native_calls = 0
+        self.calls: list[str] = []
+        self.guard_results: list[bool] = []
+
+    def insert(self, _text: str, *, before_batch) -> None:
+        del before_batch
+        raise AssertionError("unverified fallback must never use chunked insert")
+
+    def insert_atomic(self, text: str, *, before_batch) -> None:
+        self.atomic_calls += 1
+        self.calls.append(text)
+        if self.before_guard is not None:
+            self.before_guard()
+        allowed = bool(before_batch())
+        self.guard_results.append(allowed)
+        if not allowed:
+            raise TextInsertionError(
+                "guard rejected",
+                partial=False,
+                reason_code="input_guard_rejected",
+            )
+
+        # This counter represents crossing the one native SendInput boundary.
+        self.native_calls += 1
+        if self.outcome == "zero":
+            raise TextInsertionError("zero events accepted", partial=False)
+        if self.outcome == "partial":
+            start, end = self.document.selection
+            self.document.text = (
+                self.document.text[:start] + text[:1] + self.document.text[end:]
+            )
+            self.document.selection = (start + 1, start + 1)
+            raise TextInsertionError("partial native result", partial=True)
+        if self.outcome == "unknown":
+            raise RuntimeError("native result unavailable")
+        if self.outcome == "accepted_noop":
+            if self.after_input is not None:
+                self.after_input()
+            return
+
+        start, end = self.document.selection
+        self.document.text = (
+            self.document.text[:start] + text + self.document.text[end:]
+        )
+        caret = start + len(text)
+        self.document.selection = (caret, caret)
+        if self.after_input is not None:
+            self.after_input()
+
+    def replace_selection(self, _text: str) -> None:
+        raise AssertionError("insert_verified must use insert_atomic")
+
+
+def test_insert_verified_rejects_identical_preexisting_suffix_noop(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("voicetype_local.session_editor.time.sleep", lambda _v: None)
+    document = _Document("already")
+    inserter = _VerifiedInputInserter(document, noop=True)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified("already", _target())
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "insertion_delta_unverified"
+    assert document.text == "already"
+    assert inserter.calls == ["already"]
+    assert inserter.guard_results == [True]
+
+
+def test_insert_verified_normal_append_succeeds() -> None:
+    document = _Document("before ")
+    inserter = _VerifiedInputInserter(document)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified("after", _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.reason_code == "ok"
+    assert result.backend == "uia_text_delta+sendinput_unicode:suffix_exact"
+    assert document.text == "before after"
+    assert document.selection == (len(document.text), len(document.text))
+
+
+def test_insert_verified_repeated_identical_append_succeeds() -> None:
+    document = _Document("echo")
+    inserter = _VerifiedInputInserter(document)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified("echo", _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert document.text == "echoecho"
+    assert document.selection == (8, 8)
+
+
+def test_insert_verified_replaces_noncollapsed_selection() -> None:
+    document = _Document("before OLD after")
+    document.selection = (7, 10)
+    inserter = _VerifiedInputInserter(document)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified("new", _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert document.text == "before new after"
+    assert document.selection == (10, 10)
+
+
+def test_insert_verified_handles_long_non_bmp_and_newline_text() -> None:
+    document = _Document("prefix:")
+    raw = ("😀 строка\r\n" * 80) + "конец"
+    normalized = raw.replace("\r\n", "\n")
+    inserter = _VerifiedInputInserter(document, chunk_size=73)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified(raw, _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert document.text == "prefix:" + normalized
+    assert inserter.calls == [normalized]
+    assert len(inserter.guard_results) > 1
+    assert all(inserter.guard_results)
+
+
+def test_insert_verified_prefers_single_call_atomic_inserter() -> None:
+    document = _Document("prefix:")
+    raw = ("😀 строка\r\n" * 80) + "конец"
+    normalized = raw.replace("\r\n", "\n")
+
+    class _AtomicInserter(_VerifiedInputInserter):
+        atomic_calls = 0
+
+        def insert(self, _text: str, *, before_batch) -> None:
+            del before_batch
+            raise AssertionError("legacy chunked insert must not run")
+
+        def insert_atomic(self, text: str, *, before_batch) -> None:
+            self.atomic_calls += 1
+            self.calls.append(text)
+            allowed = bool(before_batch())
+            self.guard_results.append(allowed)
+            if not allowed:
+                raise TextInsertionError(
+                    "guard rejected",
+                    partial=False,
+                    reason_code="input_guard_rejected",
+                )
+            start, end = self.document.selection
+            self.document.text = (
+                self.document.text[:start] + text + self.document.text[end:]
+            )
+            caret = start + len(text)
+            self.document.selection = (caret, caret)
+
+    inserter = _AtomicInserter(document)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified(raw, _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.reason_code == "ok"
+    assert document.text == "prefix:" + normalized
+    assert inserter.calls == [normalized]
+    assert inserter.atomic_calls == 1
+    assert inserter.guard_results == [True]
+
+
+def test_insert_verified_atomic_focus_loss_after_input_is_success_unverified() -> None:
+    """Live regression: completed input must not enter pending/retry state."""
+
+    document = _Document("safe ")
+    focus = _Focus()
+    inserter = _GuardedAtomicInserter(
+        document,
+        after_input=lambda: setattr(focus, "match", FocusMatch.CHANGED),
+    )
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        focus,  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified("text", _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.reason_code == "ok_unverified"
+    assert "guarded_unverified" in result.backend
+    assert "focus_changed" in result.backend
+    assert document.text == "safe text"
+    assert inserter.atomic_calls == 1
+    assert inserter.native_calls == 1
+    assert inserter.guard_results == [True]
+
+
+def test_insert_verified_atomic_missing_postcheck_pattern_is_success_unverified(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("voicetype_local.session_editor.time.sleep", lambda _v: None)
+    document = _Document("safe ")
+
+    class _PatternDisappearsControl(_Control):
+        def __init__(self, document: _Document) -> None:
+            super().__init__(document)
+            self.pattern_calls = 0
+
+        def GetTextPattern(self):
+            self.pattern_calls += 1
+            return _Pattern(self.document) if self.pattern_calls <= 2 else None
+
+    control = _PatternDisappearsControl(document)
+    inserter = _GuardedAtomicInserter(document)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(control),
+    )
+
+    result = editor.insert_verified("text", _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.reason_code == "ok_unverified"
+    assert "guarded_unverified" in result.backend
+    assert "text_pattern_unavailable" in result.backend
+    assert document.text == "safe text"
+    assert inserter.atomic_calls == 1
+
+
+def test_insert_verified_atomic_unprovable_delta_is_success_unverified(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("voicetype_local.session_editor.time.sleep", lambda _v: None)
+    document = _Document("safe")
+    inserter = _GuardedAtomicInserter(document, outcome="accepted_noop")
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified("text", _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.reason_code == "ok_unverified"
+    assert "guarded_unverified" in result.backend
+    assert inserter.atomic_calls == 1
+    assert inserter.native_calls == 1
+
+
+def test_insert_verified_atomic_postcheck_exception_is_success_unverified() -> None:
+    document = _Document("safe ")
+
+    class _PostcheckRaisesFocus(_Focus):
+        fail = False
+
+        def compare_current(self, expected: FocusTarget) -> FocusMatch:
+            if self.fail:
+                raise RuntimeError("UIA focus provider disappeared")
+            return super().compare_current(expected)
+
+    focus = _PostcheckRaisesFocus()
+    inserter = _GuardedAtomicInserter(
+        document,
+        after_input=lambda: setattr(focus, "fail", True),
+    )
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        focus,  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified("text", _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.reason_code == "ok_unverified"
+    assert result.backend.endswith("guarded_unverified:postcheck_exception")
+    assert document.text == "safe text"
+    assert inserter.atomic_calls == 1
+
+
+def test_insert_verified_atomic_cancellation_after_input_stays_uncertain() -> None:
+    document = _Document("safe ")
+    current = True
+
+    def cancel_after_input() -> None:
+        nonlocal current
+        current = False
+
+    inserter = _GuardedAtomicInserter(document, after_input=cancel_after_input)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified(
+        "text",
+        _target(),
+        is_current=lambda: current,
+    )
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "request_cancelled_after_input"
+    assert document.text == "safe text"
+    assert inserter.atomic_calls == 1
+
+
+def test_insert_verified_no_text_pattern_uses_one_guarded_atomic_call() -> None:
+    document = _Document("before ")
+
+    class _NoPatternControl(_Control):
+        def GetTextPattern(self):
+            return None
+
+    inserter = _GuardedAtomicInserter(document)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_NoPatternControl(document)),
+    )
+
+    result = editor.insert_verified("after", _target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.reason_code == "ok_unverified"
+    assert "guarded_unverified" in result.backend
+    assert document.text == "before after"
+    assert inserter.calls == ["after"]
+    assert inserter.atomic_calls == 1
+    assert inserter.native_calls == 1
+    assert inserter.guard_results == [True]
+
+
+@pytest.mark.parametrize("boundary_change", ["focus", "cancel"])
+def test_insert_verified_no_text_pattern_rejects_boundary_change_without_input(
+    boundary_change: str,
+) -> None:
+    document = _Document("safe")
+
+    class _NoPatternControl(_Control):
+        def GetTextPattern(self):
+            return None
+
+    focus = _Focus()
+    current = True
+
+    def change_at_boundary() -> None:
+        nonlocal current
+        if boundary_change == "focus":
+            focus.match = FocusMatch.CHANGED
+        else:
+            current = False
+
+    inserter = _GuardedAtomicInserter(document, before_guard=change_at_boundary)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        focus,  # type: ignore[arg-type]
+        _Automation(_NoPatternControl(document)),
+    )
+
+    result = editor.insert_verified(
+        " text",
+        _target(),
+        is_current=lambda: current,
+    )
+
+    assert result.status is SessionEditorStatus.REJECTED
+    assert result.reason_code == (
+        "focus_changed" if boundary_change == "focus" else "request_cancelled"
+    )
+    assert "guarded_unverified" in result.backend
+    assert inserter.atomic_calls == 1
+    assert inserter.native_calls == 0
+    assert inserter.guard_results == [False]
+    assert document.text == "safe"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_status", "expected_reason"),
+    [
+        ("zero", SessionEditorStatus.FAILED, "insertion_input_failed"),
+        ("partial", SessionEditorStatus.UNCERTAIN, "insertion_may_be_partial"),
+        ("unknown", SessionEditorStatus.UNCERTAIN, "insertion_result_unknown"),
+    ],
+)
+def test_insert_verified_no_text_pattern_preserves_atomic_error_semantics(
+    outcome: str,
+    expected_status: SessionEditorStatus,
+    expected_reason: str,
+) -> None:
+    document = _Document("safe")
+
+    class _NoPatternControl(_Control):
+        def GetTextPattern(self):
+            return None
+
+    inserter = _GuardedAtomicInserter(document, outcome=outcome)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_NoPatternControl(document)),
+    )
+
+    result = editor.insert_verified("text", _target())
+
+    assert result.status is expected_status
+    assert result.reason_code == expected_reason
+    assert "guarded_unverified" in result.backend
+    assert inserter.atomic_calls == 1
+    assert inserter.native_calls == 1
+    assert inserter.guard_results == [True]
+    assert document.text == ("safet" if outcome == "partial" else "safe")
+
+
+def test_insert_verified_preflight_blocks_without_sendinput() -> None:
+    document = _Document("safe")
+
+    class _NoPatternControl(_Control):
+        def GetTextPattern(self):
+            return None
+
+    class _OtherRuntimeControl(_Control):
+        def GetRuntimeId(self):
+            return (99,)
+
+    cases = (
+        SessionTextEditor(
+            _VerifiedInputInserter(document),  # type: ignore[arg-type]
+            _Focus(FocusMatch.CHANGED),  # type: ignore[arg-type]
+            _Automation(_Control(document)),
+        ),
+        SessionTextEditor(
+            _VerifiedInputInserter(document),  # type: ignore[arg-type]
+            _Focus(),  # type: ignore[arg-type]
+            _Automation(_Control(document, password=True)),
+        ),
+        SessionTextEditor(
+            _VerifiedInputInserter(document),  # type: ignore[arg-type]
+            _Focus(),  # type: ignore[arg-type]
+            _Automation(_NoPatternControl(document)),
+        ),
+        SessionTextEditor(
+            _VerifiedInputInserter(document),  # type: ignore[arg-type]
+            _Focus(),  # type: ignore[arg-type]
+            _Automation(_OtherRuntimeControl(document)),
+        ),
+    )
+
+    results = [editor.insert_verified(" text", _target()) for editor in cases]
+
+    assert [result.status for result in results] == [
+        SessionEditorStatus.REJECTED,
+        SessionEditorStatus.REJECTED,
+        SessionEditorStatus.UNAVAILABLE,
+        SessionEditorStatus.REJECTED,
+    ]
+    assert [result.reason_code for result in results] == [
+        "focus_changed",
+        "password_field_prohibited",
+        "text_pattern_unavailable",
+        "focus_changed",
+    ]
+    assert all(
+        editor.inserter.calls == []  # type: ignore[attr-defined]
+        for editor in cases
+    )
+    assert document.text == "safe"
+
+
+def test_insert_verified_requires_captured_runtime_id_without_sending() -> None:
+    document = _Document("safe")
+    inserter = _VerifiedInputInserter(document)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified(
+        " text",
+        _targeted_target(class_name="Edit", runtime_id=None),
+    )
+
+    assert result.status is SessionEditorStatus.UNAVAILABLE
+    assert result.reason_code == "runtime_id_unavailable"
+    assert inserter.calls == []
+    assert document.text == "safe"
+
+
+def test_insert_verified_cancelled_preflight_does_not_send() -> None:
+    document = _Document("safe")
+    inserter = _VerifiedInputInserter(document)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified(" text", _target(), is_current=lambda: False)
+
+    assert result.status is SessionEditorStatus.REJECTED
+    assert result.reason_code == "request_cancelled"
+    assert inserter.calls == []
+    assert document.text == "safe"
+
+
+def test_insert_verified_cancelled_during_batches_is_uncertain() -> None:
+    document = _Document("safe")
+    inserter = _VerifiedInputInserter(document, chunk_size=2)
+    checks = 0
+
+    def is_current() -> bool:
+        nonlocal checks
+        checks += 1
+        # Initial preflight plus both checks around the first native batch pass;
+        # cancellation is observed before the second batch.
+        return checks < 4
+
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+
+    result = editor.insert_verified(
+        "abcdef",
+        _target(),
+        is_current=is_current,
+    )
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "insertion_may_be_partial"
+    assert document.text == "safeab"
+    assert inserter.guard_results == [True, False]
+
+
+def test_insert_verified_partial_and_unknown_errors_are_uncertain() -> None:
+    partial_document = _Document("safe")
+
+    class _PartialInserter(_VerifiedInputInserter):
+        def insert(self, text: str, *, before_batch) -> None:
+            self.calls.append(text)
+            assert before_batch()
+            start, end = self.document.selection
+            self.document.text = (
+                self.document.text[:start]
+                + text[:1]
+                + self.document.text[end:]
+            )
+            self.document.selection = (start + 1, start + 1)
+            raise TextInsertionError("partial", partial=True)
+
+    unknown_document = _Document("safe")
+
+    class _UnknownInserter(_VerifiedInputInserter):
+        def insert(self, text: str, *, before_batch) -> None:
+            self.calls.append(text)
+            assert before_batch()
+            raise RuntimeError("unknown native result")
+
+    partial = SessionTextEditor(
+        _PartialInserter(partial_document),  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(partial_document)),
+    ).insert_verified("text", _target())
+    unknown = SessionTextEditor(
+        _UnknownInserter(unknown_document),  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(unknown_document)),
+    ).insert_verified("text", _target())
+
+    assert (partial.status, partial.reason_code) == (
+        SessionEditorStatus.UNCERTAIN,
+        "insertion_may_be_partial",
+    )
+    assert (unknown.status, unknown.reason_code) == (
+        SessionEditorStatus.UNCERTAIN,
+        "insertion_result_unknown",
+    )
+    assert partial_document.text == "safet"
+
+
+def test_insert_verified_shares_nonblocking_operation_lock() -> None:
+    document = _Document("safe")
+    inserter = _VerifiedInputInserter(document)
+    editor = SessionTextEditor(
+        inserter,  # type: ignore[arg-type]
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+    )
+    assert editor._operation_lock.acquire(blocking=False)  # type: ignore[attr-defined]
+    try:
+        result = editor.insert_verified(" text", _target())
+    finally:
+        editor._operation_lock.release()  # type: ignore[attr-defined]
+
+    assert result.status is SessionEditorStatus.UNAVAILABLE
+    assert result.reason_code == "session_editor_busy"
+    assert inserter.calls == []
+    assert document.text == "safe"
+
+
+class _NeverFallbackInserter:
+    def replace_selection(self, _text: str) -> None:
+        raise AssertionError("SendInput fallback must not run")
+
+    def replace_selection_guarded(self, _text: str, *, before_batch) -> None:
+        del before_batch
+        raise AssertionError("SendInput fallback must not run")
+
+
+def test_apply_uses_targeted_backend_for_full_delete_to_empty() -> None:
+    document = _Document("Голосовая вставка")
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _NeverFallbackInserter(),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+        targeted_inserter=targeted,  # type: ignore[arg-type]
+    )
+    plan = plan_session_edit(
+        document.text,
+        SessionEditRequest(
+            SessionEditAction.DELETE_LAST_DICTATION,
+            CommandLanguage.RU,
+        ),
+    )
+
+    result = editor.apply(plan, _targeted_target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.backend == "uia_text+richedit_targeted"
+    assert result.empty_document_verified is True
+    assert document.text == ""
+    assert document.selection == (0, 0)
+    assert targeted.calls == [("", 2, RICHEDIT_D2DPT_CLASS)]
+
+
+def test_apply_uses_targeted_backend_for_ru_emoji_replacement() -> None:
+    document = _Document("Привет мир")
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _NeverFallbackInserter(),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+        targeted_inserter=targeted,  # type: ignore[arg-type]
+    )
+    plan = plan_session_edit(
+        document.text,
+        SessionEditRequest(
+            SessionEditAction.REPLACE_UNIQUE,
+            CommandLanguage.RU,
+            old_text="мир",
+            new_text="мир 🌍",
+        ),
+    )
+
+    result = editor.apply(plan, _targeted_target())
+
+    assert result.status is SessionEditorStatus.EXECUTED
+    assert result.backend == "uia_text+richedit_targeted"
+    assert document.text == "Привет мир 🌍"
+    assert targeted.calls == [("мир 🌍", 2, RICHEDIT_D2DPT_CLASS)]
+
+
+def test_apply_targeted_timeout_is_uncertain_without_fallback() -> None:
+    document = _Document("Привет мир")
+    targeted = _TargetedTestInserter(
+        document,
+        TargetedInsertionResult.timeout(),
+    )
+    editor = SessionTextEditor(
+        _NeverFallbackInserter(),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+        targeted_inserter=targeted,  # type: ignore[arg-type]
+    )
+    plan = plan_session_edit(
+        document.text,
+        SessionEditRequest(
+            SessionEditAction.REPLACE_UNIQUE,
+            CommandLanguage.RU,
+            old_text="мир",
+            new_text="земля",
+        ),
+    )
+
+    result = editor.apply(plan, _targeted_target())
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "edit_result_unknown"
+    assert result.backend == "richedit_targeted"
+    assert document.text == "Привет мир"
+    assert targeted.calls == [("земля", 2, RICHEDIT_D2DPT_CLASS)]
+
+
+def test_apply_targeted_safe_rejection_restores_original_caret() -> None:
+    document = _Document("Привет мир")
+    original_caret = document.selection
+    targeted = _TargetedTestInserter(
+        document,
+        TargetedInsertionResult.rejected("backend_unavailable"),
+    )
+    editor = SessionTextEditor(
+        _NeverFallbackInserter(),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+        targeted_inserter=targeted,  # type: ignore[arg-type]
+    )
+    plan = plan_session_edit(
+        document.text,
+        SessionEditRequest(
+            SessionEditAction.REPLACE_UNIQUE,
+            CommandLanguage.RU,
+            old_text="мир",
+            new_text="земля",
+        ),
+    )
+
+    result = editor.apply(plan, _targeted_target())
+
+    assert result.status is SessionEditorStatus.UNAVAILABLE
+    assert result.reason_code == "backend_unavailable"
+    assert result.backend == "richedit_targeted"
+    assert document.text == "Привет мир"
+    assert document.selection == original_caret
+    assert targeted.calls == [("земля", 2, RICHEDIT_D2DPT_CLASS)]
+
+
+def test_apply_targeted_guard_failure_matches_existing_rejection() -> None:
+    document = _Document("Привет мир")
+
+    class _FocusChangesAtInputGate:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def compare_current(self, _expected: FocusTarget) -> FocusMatch:
+            self.calls += 1
+            return FocusMatch.SAME if self.calls <= 6 else FocusMatch.CHANGED
+
+    focus = _FocusChangesAtInputGate()
+    targeted = _TargetedTestInserter(document)
+    editor = SessionTextEditor(
+        _NeverFallbackInserter(),
+        focus,  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+        targeted_inserter=targeted,  # type: ignore[arg-type]
+    )
+    plan = plan_session_edit(
+        document.text,
+        SessionEditRequest(
+            SessionEditAction.REPLACE_UNIQUE,
+            CommandLanguage.RU,
+            old_text="мир",
+            new_text="земля",
+        ),
+    )
+
+    result = editor.apply(plan, _targeted_target())
+
+    assert result.status is SessionEditorStatus.REJECTED
+    assert result.reason_code == "focus_changed_after_selection"
+    assert result.backend == "richedit_targeted"
+    assert focus.calls == 7
+    assert targeted.guard_results == [False]
+    assert targeted.calls == []
+    assert document.text == "Привет мир"
+
+
+def test_apply_targeted_accepted_still_requires_existing_postcheck(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("voicetype_local.session_editor.time.sleep", lambda _value: None)
+    document = _Document("Привет мир")
+    targeted = _TargetedTestInserter(document, apply_replacement=False)
+    editor = SessionTextEditor(
+        _NeverFallbackInserter(),
+        _Focus(),  # type: ignore[arg-type]
+        _Automation(_Control(document)),
+        targeted_inserter=targeted,  # type: ignore[arg-type]
+    )
+    plan = plan_session_edit(
+        document.text,
+        SessionEditRequest(
+            SessionEditAction.REPLACE_UNIQUE,
+            CommandLanguage.RU,
+            old_text="мир",
+            new_text="земля",
+        ),
+    )
+
+    result = editor.apply(plan, _targeted_target())
+
+    assert result.status is SessionEditorStatus.UNCERTAIN
+    assert result.reason_code == "edit_verification_failed"
+    assert "richedit_targeted" in result.backend
+    assert document.text == "Привет мир"
+    assert targeted.calls == [("земля", 2, RICHEDIT_D2DPT_CLASS)]

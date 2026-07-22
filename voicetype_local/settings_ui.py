@@ -189,7 +189,7 @@ class SettingsFormValues:
     interaction_mode: str = "dictation"
     dictation_commands_enabled: bool = True
     remove_fillers: bool = False
-    automatic_spacing: bool = False
+    automatic_spacing: bool = True
     sounds: bool = True
     correction_mode: str = "local_basic"
     transcription_mode: str = "local"
@@ -248,7 +248,7 @@ class SettingsFormValues:
                 settings, "dictation_commands_enabled", True
             ),
             remove_fillers=_setting_bool(settings, "remove_fillers", False),
-            automatic_spacing=_setting_bool(settings, "automatic_spacing", False),
+            automatic_spacing=_setting_bool(settings, "automatic_spacing", True),
             sounds=_setting_bool(settings, "sounds", True),
             correction_mode=_valid_initial_choice(
                 _setting_value(settings, "correction_mode", "local_basic"),
@@ -532,6 +532,7 @@ class SettingsWindow:
         on_clear_session: Callable[[], object] | None = None,
         on_memory: Callable[[], object] | None = None,
         on_help: Callable[[], object] | None = None,
+        on_quick_test: Callable[[], object] | None = None,
         has_last_text: bool = False,
         has_raw_text: bool = False,
         status_text: str = "Готово к работе",
@@ -552,6 +553,7 @@ class SettingsWindow:
         self._on_clear_session = on_clear_session
         self._on_memory = on_memory
         self._on_help = on_help
+        self._on_quick_test = on_quick_test
         self._has_last_text = bool(has_last_text)
         self._has_raw_text = bool(has_raw_text)
         self._main_status_text = str(status_text)[:120]
@@ -1547,15 +1549,31 @@ class SettingsWindow:
             )
             value_label.grid(row=1, column=0, sticky="ew", pady=(4, 0))
             self._feedback_value_labels[key] = value_label
+        button(
+            feedback,
+            5,
+            "Быстрая проверка",
+            self._on_quick_test,
+            leave_window=True,
+        )
         tk.Label(
             feedback,
-            text="Опасные действия выполняются только после отдельного подтверждения.",
+            text="3 голосовых шага подряд · результат проверяется автоматически.",
+            font=("Segoe UI", 9),
+            bg="#091D2C",
+            fg="#A9BAC9",
+            justify="left",
+            wraplength=255,
+        ).grid(row=6, column=0, sticky="sw", pady=(8, 0))
+        tk.Label(
+            feedback,
+            text="В режиме проверки остальные голосовые действия заблокированы.",
             font=("Segoe UI", 9),
             bg="#091D2C",
             fg="#F59E0B",
             justify="left",
             wraplength=255,
-        ).grid(row=5, column=0, sticky="sw", pady=(10, 0))
+        ).grid(row=7, column=0, sticky="sw", pady=(4, 0))
 
         # Речь.
         for column in range(2):
@@ -1587,7 +1605,7 @@ class SettingsWindow:
         correction_box = panel(text_tab, "Коррекция")
         correction_box.grid(row=2, column=0, sticky="nsew", padx=(0, 8))
         correction = self._combo(correction_box, 1, "Режим коррекции", self._correction_var, CORRECTION_MODE_OPTIONS)
-        note(correction_box, "Бережный локальный режим исправляет пробелы, регистр, пунктуацию и очевидные повторы — без перефразирования.", 3)
+        note(correction_box, "Бережный локальный режим исправляет пробелы, регистр, пунктуацию, очевидные повторы и несколько подтверждённых написаний по контексту — без сети и перефразирования.", 3)
         field_label(correction_box, "Локальная модель Ollama (для compact / full)", 4)
         local_model = entry(correction_box, self._local_model_var, 5)
 
@@ -2679,6 +2697,7 @@ def open_settings_window(
     on_clear_session: Callable[[], object] | None = None,
     on_memory: Callable[[], object] | None = None,
     on_help: Callable[[], object] | None = None,
+    on_quick_test: Callable[[], object] | None = None,
     has_last_text: bool = False,
     has_raw_text: bool = False,
     status_text: str = "Готово к работе",
@@ -2703,6 +2722,7 @@ def open_settings_window(
         on_clear_session=on_clear_session,
         on_memory=on_memory,
         on_help=on_help,
+        on_quick_test=on_quick_test,
         has_last_text=has_last_text,
         has_raw_text=has_raw_text,
         status_text=status_text,

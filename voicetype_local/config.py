@@ -73,7 +73,7 @@ class Settings:
     interaction_mode: str = "dictation"
     dictation_commands_enabled: bool = True
     remove_fillers: bool = False
-    automatic_spacing: bool = False
+    automatic_spacing: bool = True
     overlay_size: str = "large"
     overlay_contrast: str = "high"
     overlay_position: str = "top"
@@ -152,7 +152,7 @@ class Settings:
         )
         self.remove_fillers = _strict_bool(self.remove_fillers, default=False)
         self.automatic_spacing = _strict_bool(
-            self.automatic_spacing, default=False
+            self.automatic_spacing, default=True
         )
         self.cloud_text_consent = _strict_bool(
             self.cloud_text_consent, default=False

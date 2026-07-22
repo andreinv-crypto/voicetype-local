@@ -121,7 +121,7 @@ def test_form_dictation_booleans_use_strict_defaults_and_round_trip() -> None:
     ).values
     assert malformed.dictation_commands_enabled is True
     assert malformed.remove_fillers is False
-    assert malformed.automatic_spacing is False
+    assert malformed.automatic_spacing is True
 
     model = SettingsFormModel(Settings())
     model.update(
@@ -133,6 +133,9 @@ def test_form_dictation_booleans_use_strict_defaults_and_round_trip() -> None:
     assert changes["dictation_commands_enabled"] is False
     assert changes["remove_fillers"] is True
     assert changes["automatic_spacing"] is True
+
+    opt_out = SettingsFormModel({"automatic_spacing": False}).values
+    assert opt_out.automatic_spacing is False
 
 
 def test_activation_keys_are_an_explicit_safe_allowlist() -> None:
@@ -560,6 +563,7 @@ def test_public_factory_and_window_constructor_keep_callback_contract_in_sync() 
         "on_clear_session",
         "on_memory",
         "on_help",
+        "on_quick_test",
         "has_last_text",
         "has_raw_text",
         "status_text",
@@ -601,6 +605,16 @@ def test_constructor_uses_dark_side_navigation_build_not_legacy_builder() -> Non
     assert "Понимать «точка»" in build_source
     assert "Убирать безопасные слова-паразиты" in build_source
     assert "Добавлять пробел между диктовками" in build_source
+    assert "Быстрая проверка" in build_source
+    assert "3 голосовых шага подряд" in build_source
+
+
+def test_quick_test_button_leaves_settings_before_opening_native_field() -> None:
+    source = inspect.getsource(SettingsWindow._build)
+
+    quick_test_call = source[source.index('"Быстрая проверка"') :]
+    assert "self._on_quick_test" in quick_test_call[:180]
+    assert "leave_window=True" in quick_test_call[:220]
 
 
 def test_home_mode_cards_map_to_existing_interaction_values() -> None:

@@ -191,6 +191,33 @@ class UnicodeTextInserter:
                 ) from exc
             raise
 
+    def insert_atomic(
+        self,
+        text: str,
+        *,
+        before_batch: Callable[[], bool] | None = None,
+    ) -> None:
+        """Insert all Unicode keyboard events with one ``SendInput`` call.
+
+        This path is intentionally separate from :meth:`insert`: callers that
+        need the legacy bounded batches keep their existing behaviour.  The
+        complete event array is built only after text validation, then
+        ``_send`` evaluates the single guard immediately before crossing the
+        native boundary.
+        """
+
+        normalized = self._validated_text(text)
+        events: list[INPUT] = []
+        for character in normalized:
+            for unit in _unicode_units(character):
+                events.extend(
+                    [
+                        _key_event(0, unit, KEYEVENTF_UNICODE),
+                        _key_event(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+                    ]
+                )
+        self._send(events, before_batch=before_batch)
+
     def replace_selection(self, text: str) -> None:
         """Replace an already verified selection without using the clipboard.
 

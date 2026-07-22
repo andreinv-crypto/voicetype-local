@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterable
 
 from voicetype_local.focus import (
     FocusInspector,
     FocusMatch,
     FocusTarget,
+    FocusUnknownReason,
+    RuntimeIdStatus,
     Win32FocusState,
+    _TimedRuntimeIdProvider,
     compare_focus_targets,
 )
 
@@ -38,6 +42,21 @@ class _RuntimeIds:
 class _BrokenRuntimeIds:
     def focused_runtime_id(self) -> Iterable[int] | None:
         raise RuntimeError("UIA provider unavailable")
+
+
+class _FirstRuntimeIdCallStalls:
+    def __init__(self, value: Iterable[int]) -> None:
+        self.value = value
+        self.calls = 0
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+
+    def focused_runtime_id(self) -> Iterable[int] | None:
+        self.calls += 1
+        if self.calls == 1:
+            self.first_started.set()
+            self.release_first.wait(timeout=2.0)
+        return self.value
 
 
 def _state(
@@ -135,6 +154,40 @@ def test_uia_failure_falls_back_without_losing_stable_win32_state() -> None:
     assert target.focused_hwnd == 110
 
 
+def test_capture_retries_missing_runtime_id_for_virtual_field() -> None:
+    state = _state(class_name="Chrome_RenderWidgetHostHWND")
+    runtime_ids = _RuntimeIds(None, [42, 7])
+    inspector = FocusInspector(
+        _Backend(state),
+        runtime_ids,
+        runtime_id_attempts=2,
+    )
+
+    target = inspector.capture()
+
+    assert target.stable
+    assert target.uia_runtime_id == (42, 7)
+    assert target.uia_runtime_id_status is RuntimeIdStatus.AVAILABLE
+    assert runtime_ids.calls == 2
+
+
+def test_capture_runtime_id_retries_are_bounded() -> None:
+    state = _state(class_name="Chrome_RenderWidgetHostHWND")
+    runtime_ids = _RuntimeIds(None)
+    inspector = FocusInspector(
+        _Backend(state),
+        runtime_ids,
+        runtime_id_attempts=2,
+    )
+
+    target = inspector.capture()
+
+    assert target.stable
+    assert target.uia_runtime_id is None
+    assert target.uia_runtime_id_status is RuntimeIdStatus.MISSING
+    assert runtime_ids.calls == 2
+
+
 def test_same_native_edit_hwnd_is_same_field_without_uia() -> None:
     assert compare_focus_targets(_target(), _target()) is FocusMatch.SAME
 
@@ -186,3 +239,99 @@ def test_missing_or_unstable_identity_is_unknown() -> None:
     assert compare_focus_targets(None, _target()) is FocusMatch.UNKNOWN
     assert _target(stable=False).compare(_target()) is FocusMatch.UNKNOWN
     assert _target(focused=0).compare(_target(focused=0)) is FocusMatch.UNKNOWN
+
+
+def test_compare_recaptures_when_end_runtime_id_is_temporarily_missing() -> None:
+    state = _state(class_name="Chrome_RenderWidgetHostHWND")
+    runtime_ids = _RuntimeIds([42, 7], None, [42, 7])
+    inspector = FocusInspector(
+        _Backend(state),
+        runtime_ids,
+        runtime_id_attempts=1,
+        comparison_attempts=2,
+    )
+    expected = inspector.capture()
+
+    comparison = inspector.compare_current_detailed(expected)
+
+    assert comparison.match is FocusMatch.SAME
+    assert comparison.attempts == 2
+    assert comparison.unknown_reason is None
+    assert comparison.encountered_unknown_reasons == (
+        FocusUnknownReason.CURRENT_RUNTIME_ID_MISSING,
+    )
+    assert runtime_ids.calls == 3
+    assert inspector.last_comparison is comparison
+
+
+def test_both_missing_runtime_ids_keep_virtual_field_unknown_without_guessing() -> None:
+    state = _state(class_name="Chrome_RenderWidgetHostHWND")
+    runtime_ids = _RuntimeIds(None)
+    inspector = FocusInspector(
+        _Backend(state),
+        runtime_ids,
+        runtime_id_attempts=1,
+        comparison_attempts=2,
+    )
+    expected = inspector.capture()
+
+    comparison = inspector.compare_current_detailed(expected)
+
+    assert comparison.match is FocusMatch.UNKNOWN
+    assert comparison.unknown_reason is FocusUnknownReason.BOTH_RUNTIME_IDS_MISSING
+    assert comparison.attempts == 1
+    assert comparison.expected_runtime_status is RuntimeIdStatus.MISSING
+    assert comparison.current_runtime_status is RuntimeIdStatus.MISSING
+    assert runtime_ids.calls == 2
+
+
+def test_timeout_probe_can_recover_while_first_worker_is_still_stuck() -> None:
+    state = _state(class_name="Chrome_RenderWidgetHostHWND")
+    slow_then_ready = _FirstRuntimeIdCallStalls([42, 7])
+    timed = _TimedRuntimeIdProvider(slow_then_ready, timeout_seconds=0.05)
+    inspector = FocusInspector(
+        _Backend(state),
+        timed,
+        runtime_id_attempts=1,
+        comparison_attempts=2,
+    )
+    expected = _target(
+        class_name="Chrome_RenderWidgetHostHWND",
+        runtime_id=(42, 7),
+    )
+
+    try:
+        comparison = inspector.compare_current_detailed(expected)
+    finally:
+        slow_then_ready.release_first.set()
+
+    assert slow_then_ready.first_started.is_set()
+    assert slow_then_ready.calls == 2
+    assert comparison.match is FocusMatch.SAME
+    assert comparison.attempts == 2
+    assert comparison.encountered_unknown_reasons == (
+        FocusUnknownReason.CURRENT_RUNTIME_ID_TIMED_OUT,
+    )
+
+
+def test_genuine_changed_target_is_not_retried_after_detection() -> None:
+    changed_state = _state(focused=120, class_name="Chrome_RenderWidgetHostHWND")
+    runtime_ids = _RuntimeIds(None, [42, 7])
+    inspector = FocusInspector(
+        _Backend(changed_state),
+        runtime_ids,
+        runtime_id_attempts=1,
+        comparison_attempts=2,
+    )
+    expected = _target(
+        focused=110,
+        class_name="Chrome_RenderWidgetHostHWND",
+        runtime_id=(42, 7),
+    )
+
+    comparison = inspector.compare_current_detailed(expected)
+
+    assert comparison.match is FocusMatch.CHANGED
+    assert comparison.attempts == 1
+    assert comparison.encountered_unknown_reasons == ()
+    assert runtime_ids.calls == 1

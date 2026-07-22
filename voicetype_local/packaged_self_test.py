@@ -21,7 +21,10 @@ REQUIRED_CONTROL_MODULES = (
     "voicetype_local.dictation_transform",
     "voicetype_local.session_editing",
     "voicetype_local.session_editor",
+    "voicetype_local.targeted_inserter",
+    "voicetype_local.test_lab",
     "voicetype_local.windows_session_editor_probe",
+    "voicetype_local.windows_targeted_inserter_probe",
 )
 
 REQUIRED_CONTROL_SYMBOLS = {
@@ -34,8 +37,20 @@ REQUIRED_CONTROL_SYMBOLS = {
     "voicetype_local.dictation_transform": ("transform_dictation",),
     "voicetype_local.session_editing": ("SessionEditCommandParser",),
     "voicetype_local.session_editor": ("SessionTextEditor",),
+    "voicetype_local.targeted_inserter": (
+        "TargetedRichEditInserter",
+        "Win32RichEditMessageBackend",
+    ),
+    "voicetype_local.test_lab": (
+        "NativeRichEditField",
+        "QuickTestSession",
+        "QuickTestWindow",
+    ),
     "voicetype_local.windows_session_editor_probe": (
         "run_isolated_session_editor_probe",
+    ),
+    "voicetype_local.windows_targeted_inserter_probe": (
+        "run_isolated_targeted_inserter_probe",
     ),
 }
 
