@@ -11,9 +11,10 @@
   сохранённая на случай, если candidate окажется менее стабильным. Это
   бинарный снимок для отката; он не соответствует исходникам тега rc2.
 
-Оба архива portable: распакуйте архив целиком и запускайте
-`VoiceType Local\VoiceType Local.exe`. Одновременно две версии запускать не
-следует.
+Оба архива portable: распакуйте архив целиком. В Candidate запускайте
+`VoiceType Local\VoiceType Local.exe`, а в rollback-снимке —
+`VoiceType Local.previous\VoiceType Local.exe`. Одновременно две версии
+запускать не следует.
 
 ## Проверка candidate
 
