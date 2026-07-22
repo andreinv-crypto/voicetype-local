@@ -4,6 +4,7 @@ import ctypes
 import os
 import re
 from ctypes import wintypes
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
@@ -134,6 +135,36 @@ class DpapiSecretStore:
         temporary = path.with_suffix(".tmp")
         temporary.write_bytes(encrypted)
         temporary.replace(path)
+
+    def set_with_rollback(self, name: str, value: str) -> Callable[[], None]:
+        """Replace a secret and return a one-shot encrypted rollback action.
+
+        The previous plaintext is never loaded.  Rollback restores the exact
+        DPAPI blob that was on disk, or removes the newly-created file.
+        """
+
+        path = self._path(name)
+        previous = path.read_bytes() if path.exists() else None
+        self.set(name, value)
+        used = False
+
+        def rollback() -> None:
+            nonlocal used
+            if used:
+                return
+            used = True
+            if previous is None:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_bytes(previous)
+            temporary.replace(path)
+
+        return rollback
 
     def get(self, name: str) -> str | None:
         path = self._path(name)

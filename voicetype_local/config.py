@@ -17,9 +17,40 @@ SUPPORTED_LANGUAGES = {
     "en": "en",
 }
 
-SUPPORTED_HOTKEYS = {"right_ctrl", "f8", "f9", "f10", "pause"}
+DEDICATED_ACTIVATION_KEYS = frozenset({"right_ctrl", "f8", "f9", "f10", "pause"})
+ACTIVATION_PRIMARY_KEYS = ("f8", "f9", "f10")
+# Win+Fx cannot be reserved safely by the current low-level hook without also
+# swallowing the Win modifier.  Passing Win through while suppressing only Fx
+# can open the Start menu, so those combinations deliberately fail closed.
+ACTIVATION_MODIFIERS = ("ctrl", "alt", "shift")
+SUPPORTED_HOTKEYS = frozenset(
+    DEDICATED_ACTIVATION_KEYS
+    | {
+        f"{modifier}+{primary}"
+        for modifier in ACTIVATION_MODIFIERS
+        for primary in ACTIVATION_PRIMARY_KEYS
+    }
+)
+ACTIVATION_MODES = frozenset({"toggle", "hold"})
+UNRELIABLE_HOLD_KEYS = frozenset({"pause"})
 CORRECTION_MODES = {"off", "local_basic", "cloud_text", "local_compact", "local_full"}
 TRANSCRIPTION_MODES = {"local", "cloud_transcription"}
+INTERACTION_MODES = {"dictation", "commands", "mixed"}
+OVERLAY_SIZES = frozenset({"compact", "large", "extra_large"})
+OVERLAY_CONTRASTS = frozenset({"standard", "high"})
+OVERLAY_POSITIONS = frozenset({"top", "center", "bottom"})
+
+
+def is_supported_activation_pair(key: object, mode: object) -> bool:
+    """Return whether the hook can safely observe both edges of the binding."""
+
+    return (
+        isinstance(key, str)
+        and key in SUPPORTED_HOTKEYS
+        and isinstance(mode, str)
+        and mode in ACTIVATION_MODES
+        and not (mode == "hold" and key in UNRELIABLE_HOLD_KEYS)
+    )
 
 
 def _strict_bool(value: Any, *, default: bool) -> bool:
@@ -38,6 +69,14 @@ class Settings:
     max_record_seconds: int = 5 * 60
     sounds: bool = True
     activation_key: str = "right_ctrl"
+    activation_mode: str = "toggle"
+    interaction_mode: str = "dictation"
+    dictation_commands_enabled: bool = True
+    remove_fillers: bool = False
+    automatic_spacing: bool = True
+    overlay_size: str = "large"
+    overlay_contrast: str = "high"
+    overlay_position: str = "top"
     microphone_start_timeout_seconds: float = 10.0
     microphone_stop_timeout_seconds: float = 10.0
     transcription_timeout_seconds: float = 90.0
@@ -64,8 +103,25 @@ class Settings:
             self.compute_type = "int8"
         self.cpu_threads = min(16, max(1, int(self.cpu_threads)))
         self.max_record_seconds = min(5 * 60, max(5, int(self.max_record_seconds)))
-        if self.activation_key not in SUPPORTED_HOTKEYS:
+        if not is_supported_activation_pair(
+            self.activation_key, self.activation_mode
+        ):
             self.activation_key = "right_ctrl"
+            self.activation_mode = "toggle"
+        if self.interaction_mode not in INTERACTION_MODES:
+            self.interaction_mode = "dictation"
+        if not isinstance(self.overlay_size, str) or self.overlay_size not in OVERLAY_SIZES:
+            self.overlay_size = "large"
+        if (
+            not isinstance(self.overlay_contrast, str)
+            or self.overlay_contrast not in OVERLAY_CONTRASTS
+        ):
+            self.overlay_contrast = "high"
+        if (
+            not isinstance(self.overlay_position, str)
+            or self.overlay_position not in OVERLAY_POSITIONS
+        ):
+            self.overlay_position = "top"
         self.microphone_start_timeout_seconds = min(
             60.0, max(2.0, float(self.microphone_start_timeout_seconds))
         )
@@ -91,6 +147,13 @@ class Settings:
         self.cloud_transcription_model = str(self.cloud_transcription_model).strip()[:128]
         self.local_model = str(self.local_model).strip()[:128]
         self.sounds = _strict_bool(self.sounds, default=True)
+        self.dictation_commands_enabled = _strict_bool(
+            self.dictation_commands_enabled, default=True
+        )
+        self.remove_fillers = _strict_bool(self.remove_fillers, default=False)
+        self.automatic_spacing = _strict_bool(
+            self.automatic_spacing, default=True
+        )
         self.cloud_text_consent = _strict_bool(
             self.cloud_text_consent, default=False
         )
@@ -125,11 +188,17 @@ class SettingsStore:
         if not self.path.exists():
             return settings
         try:
-            raw: dict[str, Any] = json.loads(self.path.read_text(encoding="utf-8"))
+            encoded = self.path.read_bytes()
+            if len(encoded) > 1024 * 1024:
+                return Settings()
+            parsed = json.loads(encoded.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                return Settings()
+            raw: dict[str, Any] = parsed
             allowed = {item.name for item in fields(Settings)}
             settings = Settings(**{key: value for key, value in raw.items() if key in allowed})
             settings.validate()
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
             return Settings()
         return settings
 
@@ -139,18 +208,23 @@ class SettingsStore:
 
     def update(self, **changes: Any) -> Settings:
         with self._lock:
+            candidate = Settings(**asdict(self._settings))
             for key, value in changes.items():
-                if hasattr(self._settings, key):
-                    setattr(self._settings, key, value)
-            self._settings.validate()
-            self._save_unlocked()
+                if hasattr(candidate, key):
+                    setattr(candidate, key, value)
+            candidate.validate()
+            self._save_candidate_unlocked(candidate)
+            self._settings = candidate
             return Settings(**asdict(self._settings))
 
     def _save_unlocked(self) -> None:
+        self._save_candidate_unlocked(self._settings)
+
+    def _save_candidate_unlocked(self, settings: Settings) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_suffix(".tmp")
         temp.write_text(
-            json.dumps(asdict(self._settings), ensure_ascii=False, indent=2) + "\n",
+            json.dumps(asdict(settings), ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
         temp.replace(self.path)

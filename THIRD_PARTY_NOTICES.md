@@ -1,11 +1,15 @@
 # Third-party notices
 
-VoiceType Local 0.2.0 includes open-source runtime components. They remain under their own licenses; this notice does not replace the full license texts.
+The current VoiceType Local source tree uses open-source runtime components.
+Published packages may contain a version-specific subset. Every component
+remains under its own license; this notice does not replace the full license
+texts.
 
 Core components:
 
 - faster-whisper 1.2.1 — MIT — https://github.com/SYSTRAN/faster-whisper
 - comtypes 1.4.16 — MIT — https://github.com/enthought/comtypes
+- uiautomation 2.0.29 — Apache-2.0 — https://github.com/yinkaisheng/Python-UIAutomation-for-Windows
 - CTranslate2 — MIT — https://github.com/OpenNMT/CTranslate2
 - OpenAI Whisper model / Systran faster-whisper-small conversion — MIT — https://huggingface.co/Systran/faster-whisper-small
 - ONNX Runtime — MIT — https://github.com/microsoft/onnxruntime

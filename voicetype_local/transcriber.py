@@ -74,8 +74,6 @@ class OfflineTranscriber:
         return payload
 
     def _timeout_for(self, payload: bytes) -> float:
-        if self._fixed_transcription_timeout is not None:
-            return max(0.1, float(self._fixed_transcription_timeout))
         duration = 0.0
         try:
             with wave.open(io.BytesIO(payload), "rb") as source:
@@ -86,7 +84,16 @@ class OfflineTranscriber:
             pass
         # A short utterance should never hold the app indefinitely, while the
         # existing five-minute recording limit still gets enough time on CPU.
-        return min(600.0, max(30.0, 15.0 + duration * 2.0))
+        duration_budget = min(600.0, max(30.0, 15.0 + duration * 2.0))
+        if self._fixed_transcription_timeout is None:
+            return duration_budget
+        # The configured timeout is a ceiling, not a reason to make a short
+        # phrase wait the full global limit.  WhisperWorkerClient applies this
+        # as one total budget across recovery attempts.
+        return max(
+            0.1,
+            min(float(self._fixed_transcription_timeout), duration_budget),
+        )
 
     def transcribe(
         self,

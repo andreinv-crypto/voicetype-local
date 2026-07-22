@@ -264,9 +264,12 @@ class WhisperWorkerClient:
         if errors:
             raise WorkerError(f"Whisper worker disconnected during {stage}") from errors[0]
 
-    def _spawn_once(self) -> None:
+    def _spawn_once(self, timeout: float | None = None) -> None:
         self._check_open()
-        deadline = time.monotonic() + self.startup_timeout
+        startup_budget = self.startup_timeout
+        if timeout is not None:
+            startup_budget = max(0.1, min(startup_budget, float(timeout)))
+        deadline = time.monotonic() + startup_budget
         context = self._context_factory()
         parent_connection, child_connection = context.Pipe(duplex=True)
         process = context.Process(
@@ -300,14 +303,14 @@ class WhisperWorkerClient:
             name="whisper-process-start",
             daemon=True,
         ).start()
-        if not start_completed.wait(self.startup_timeout):
+        if not start_completed.wait(startup_budget):
             start_cancelled.set()
             try:
                 parent_connection.close()
             except OSError:
                 pass
             raise WorkerTimeoutError(
-                f"Whisper startup timed out after {self.startup_timeout:.1f}s"
+                f"Whisper startup timed out after {startup_budget:.1f}s"
             )
         if start_errors:
             try:
@@ -327,7 +330,7 @@ class WhisperWorkerClient:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise WorkerTimeoutError(
-                f"Whisper startup timed out after {self.startup_timeout:.1f}s"
+                f"Whisper startup timed out after {startup_budget:.1f}s"
             )
         response = self._wait_message(parent_connection, remaining, "startup")
         if is_message(response, MSG_READY):
@@ -341,11 +344,17 @@ class WhisperWorkerClient:
             self._check_open()
             if self.is_alive:
                 return
+            deadline = time.monotonic() + self.startup_timeout
             last_error: Exception | None = None
             for _ in range(2):
                 self._stop_current(graceful=False)
                 try:
-                    self._spawn_once()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise WorkerTimeoutError(
+                            f"Whisper startup timed out after {self.startup_timeout:.1f}s"
+                        )
+                    self._spawn_once(remaining)
                     return
                 except WorkerClosedError:
                     raise
@@ -357,14 +366,16 @@ class WhisperWorkerClient:
                 raise last_error
             raise WorkerError(f"Could not start Whisper worker: {last_error}") from last_error
 
-    def _ensure_started_once(self) -> tuple[Any, Connection]:
+    def _ensure_started_once(
+        self, timeout: float | None = None
+    ) -> tuple[Any, Connection]:
         self._check_open()
         with self._lifecycle_lock:
             process = self._process
             connection = self._connection
         if process is None or connection is None or not process.is_alive():
             self._stop_current(graceful=False)
-            self._spawn_once()
+            self._spawn_once(timeout)
             with self._lifecycle_lock:
                 process = self._process
                 connection = self._connection
@@ -386,14 +397,24 @@ class WhisperWorkerClient:
         timeout = max(0.1, float(timeout))
         with self._operation_lock:
             self._check_open()
+            deadline = time.monotonic() + timeout
             last_error: Exception | None = None
             for _ in range(2):
                 self._check_open()
                 try:
-                    _, connection = self._ensure_started_once()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise WorkerTimeoutError(
+                            f"Whisper transcription timed out after {timeout:.1f}s"
+                        )
+                    _, connection = self._ensure_started_once(remaining)
                     self._request_id += 1
                     request_id = self._request_id
-                    deadline = time.monotonic() + timeout
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise WorkerTimeoutError(
+                            f"Whisper transcription timed out after {timeout:.1f}s"
+                        )
                     self._send_message(
                         connection,
                         message(
@@ -404,7 +425,7 @@ class WhisperWorkerClient:
                             initial_prompt=str(initial_prompt)[:4000],
                             hotwords=str(hotwords)[:4000],
                         ),
-                        timeout,
+                        remaining,
                         "request transfer",
                     )
                     remaining = deadline - time.monotonic()

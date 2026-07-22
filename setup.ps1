@@ -26,6 +26,8 @@ $VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 if ($LASTEXITCODE -ne 0) { throw "Could not upgrade pip." }
 & $VenvPython -m pip install -r requirements-dev.txt
 if ($LASTEXITCODE -ne 0) { throw "Could not install dependencies." }
+& $VenvPython scripts\packaged_control_self_test.py
+if ($LASTEXITCODE -ne 0) { throw "VoiceType Control packaging preflight failed." }
 & $VenvPython scripts\download_model.py --model small --output models\small
 if ($LASTEXITCODE -ne 0) { throw "Could not download the offline model." }
 & $VenvPython -m pytest -q
